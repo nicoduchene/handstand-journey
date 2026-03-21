@@ -1,0 +1,950 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#0a0a0f">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <link rel="manifest" href="manifest.json?v=2">
+  <title>Handstand</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    :root {
+      --bg: #0a0a0f; --surface: #13131a; --border: #2a2a3a;
+      --accent: #c8b8ff; --accent-dim: rgba(200,184,255,0.15);
+      --text: #e8e8f0; --muted: #6a6a8a;
+      --success: #7fffb2; --danger: #ff7f9a; --rec: #ff4466;
+    }
+    body { background: var(--bg); color: var(--text); font-family: 'Courier New', monospace; min-height: 100vh; overflow-x: hidden; }
+
+    nav { display: flex; border-bottom: 1px solid var(--border); background: var(--surface); position: sticky; top: 0; z-index: 10; }
+    nav button { flex: 1; padding: 1rem; background: none; border: none; color: var(--muted); font-family: inherit; font-size: 0.75rem; letter-spacing: 0.15em; cursor: pointer; border-bottom: 2px solid transparent; }
+    nav button.active { color: var(--accent); border-bottom-color: var(--accent); }
+    nav .gear-btn { flex: 0; padding: 1rem 1.2rem; font-size: 1rem; }
+
+    .view { display: none; padding: 1.5rem; }
+    .view.active { display: block; }
+
+    /* TRACK */
+    #camera-view { display: none; flex-direction: column; align-items: center; gap: 1rem; padding: 1.5rem; }
+    #camera-view.active { display: flex; }
+
+    .video-container { position: relative; width: 100%; max-width: 400px; border-radius: 12px; overflow: hidden; background: #000; border: 1px solid var(--border); transition: border-color 0.3s, box-shadow 0.3s; }
+    .video-container.recording { border-color: var(--rec); box-shadow: 0 0 0 2px rgba(255,68,102,0.3); }
+    #video { width: 100%; display: block; opacity: 0; position: absolute; top: 0; left: 0; }
+    #canvas { width: 100%; display: block; transform: scaleX(-1); }
+
+    .zoom-row {
+      display: none; align-items: center; gap: 0.75rem;
+      width: 100%; max-width: 400px;
+    }
+    .zoom-row.visible { display: flex; }
+    .zoom-label { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.15em; white-space: nowrap; min-width: 40px; }
+    .zoom-slider {
+      flex: 1; -webkit-appearance: none; height: 2px;
+      background: var(--border); border-radius: 2px; outline: none;
+    }
+    .zoom-slider::-webkit-slider-thumb {
+      -webkit-appearance: none; width: 16px; height: 16px;
+      border-radius: 50%; background: var(--accent); cursor: pointer;
+    }
+    .zoom-val { font-size: 0.65rem; color: var(--accent); min-width: 32px; text-align: right; }
+
+    .shape-badge {
+      position: absolute; top: 0.5rem; right: 0.5rem;
+      background: rgba(19,19,26,0.8); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.2rem 0.5rem;
+      font-size: 0.6rem; letter-spacing: 0.15em; color: var(--accent);
+      backdrop-filter: blur(4px);
+    }
+    .view-badge {
+      position: absolute; top: 0.5rem; left: 0.5rem;
+      background: rgba(19,19,26,0.8); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.2rem 0.5rem;
+      font-size: 0.6rem; letter-spacing: 0.15em; color: var(--muted);
+      backdrop-filter: blur(4px);
+    }
+
+    .timer-display { font-size: 4rem; font-weight: 700; letter-spacing: 0.05em; color: var(--accent); text-shadow: 0 0 30px rgba(200,184,255,0.5); transition: color 0.3s; min-width: 160px; text-align: center; }
+    .timer-display.holding { color: var(--success); text-shadow: 0 0 30px rgba(127,255,178,0.5); }
+
+    .status-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.65rem; color: var(--muted); letter-spacing: 0.15em; }
+    .pose-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); transition: background 0.3s; flex-shrink: 0; }
+    .pose-dot.active { background: var(--success); box-shadow: 0 0 8px var(--success); }
+    .rec-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--rec); box-shadow: 0 0 8px var(--rec); animation: pulse 1s infinite; flex-shrink: 0; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+
+    #debug-info { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.1em; text-align: center; line-height: 1.8; display: none; }
+
+    /* FEEDBACK CARD */
+    .feedback-card {
+      width: 100%; max-width: 400px;
+      background: var(--surface); border: 1px solid var(--border);
+      border-radius: 8px; overflow: hidden;
+    }
+    .feedback-card.has-content { border-color: rgba(200,184,255,0.3); }
+    .feedback-header {
+      display: flex; justify-content: space-between; align-items: center;
+      padding: 0.6rem 0.75rem; border-bottom: 1px solid var(--border);
+      font-size: 0.6rem; letter-spacing: 0.15em; color: var(--muted);
+    }
+    .feedback-meta { display: flex; gap: 0.75rem; align-items: center; }
+    .shape-tag { color: var(--accent); }
+    .view-tag { color: var(--muted); }
+    .feedback-body { padding: 0.75rem; min-height: 48px; }
+    .feedback-text { font-size: 0.8rem; line-height: 1.6; color: var(--text); white-space: pre-wrap; }
+    .feedback-placeholder { font-size: 0.75rem; color: var(--muted); letter-spacing: 0.1em; }
+    .feedback-loading { font-size: 0.75rem; color: var(--muted); letter-spacing: 0.1em; animation: blink 1s infinite; }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0.4} }
+    .feedback-thumb { width: 100%; display: block; opacity: 0.6; cursor: pointer; transition: opacity 0.2s; border-top: 1px solid var(--border); }
+    .feedback-thumb:hover { opacity: 0.9; }
+
+    .btn { padding: 0.8rem 2rem; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-family: inherit; font-size: 0.8rem; letter-spacing: 0.1em; cursor: pointer; transition: all 0.2s; }
+    .btn:hover { border-color: var(--accent); color: var(--accent); }
+    .btn.primary { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
+    .btn.danger { border-color: var(--danger); color: var(--danger); }
+    .btn.rec-active { border-color: var(--rec); color: var(--rec); background: rgba(255,68,102,0.1); }
+    .btn:disabled { opacity: 0.4; cursor: default; }
+    .btn-row { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: center; }
+
+    .manual-row { display: flex; gap: 0.5rem; align-items: center; width: 100%; max-width: 400px; }
+    .manual-row input, .note-input { padding: 0.8rem; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: inherit; font-size: 0.85rem; }
+    .manual-row input { flex: 1; }
+    .manual-row input:focus, .note-input:focus { outline: none; border-color: var(--accent); }
+    .note-input { width: 100%; max-width: 400px; resize: none; height: 60px; }
+    .divider { width: 100%; max-width: 400px; border: none; border-top: 1px solid var(--border); }
+
+    /* LOG */
+    .stats-bar { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 1.5rem; }
+    .stat-cell { background: var(--surface); padding: 0.75rem; text-align: center; }
+    .stat-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
+    .stat-label { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.15em; margin-top: 0.2rem; }
+
+    .chart-section { margin-bottom: 1.5rem; }
+    .chart-label { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.15em; margin-bottom: 0.75rem; }
+    .bar-chart { display: flex; align-items: flex-end; gap: 3px; height: 60px; }
+    .bar-col { flex: 1; display: flex; flex-direction: column; align-items: center; gap: 4px; }
+    .bar { width: 100%; background: var(--accent-dim); border-radius: 3px 3px 0 0; border: 1px solid rgba(200,184,255,0.2); min-height: 2px; }
+    .bar.today { background: rgba(200,184,255,0.4); border-color: var(--accent); }
+    .bar-day { font-size: 0.5rem; color: var(--muted); }
+
+    .log-section-header { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.2em; margin-bottom: 1rem; }
+    .session-group { margin-bottom: 2rem; }
+    .session-date { font-size: 0.65rem; letter-spacing: 0.2em; color: var(--muted); margin-bottom: 0.5rem; padding-bottom: 0.5rem; border-bottom: 1px solid var(--border); display: flex; justify-content: space-between; }
+    .session-best { color: var(--accent); }
+    .entry { display: flex; align-items: center; gap: 1rem; padding: 0.75rem 0; border-bottom: 1px solid rgba(42,42,58,0.5); }
+    .entry:last-child { border-bottom: none; }
+    .entry-time { font-size: 1.4rem; font-weight: 700; color: var(--text); min-width: 70px; }
+    .entry-detail { flex: 1; }
+    .entry-label { font-size: 0.65rem; color: var(--muted); letter-spacing: 0.15em; }
+    .entry-note { font-size: 0.75rem; color: var(--muted); margin-top: 0.2rem; font-style: italic; }
+    .entry-delete { background: none; border: none; color: var(--border); cursor: pointer; font-size: 1rem; padding: 0.25rem; transition: color 0.2s; }
+    .entry-delete:hover { color: var(--danger); }
+    .empty-state { text-align: center; padding: 4rem 2rem; color: var(--muted); font-size: 0.8rem; letter-spacing: 0.1em; line-height: 2; }
+
+    /* VIDEOS */
+    .video-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 1rem; overflow: hidden; }
+    .video-card video { width: 100%; display: block; background: #000; max-height: 280px; object-fit: contain; }
+    .video-meta { padding: 0.75rem; display: flex; justify-content: space-between; align-items: center; }
+    .video-info { flex: 1; }
+    .video-date { font-size: 0.65rem; letter-spacing: 0.15em; color: var(--muted); }
+    .video-duration { font-size: 1rem; font-weight: 700; color: var(--accent); margin-top: 0.2rem; }
+    .video-note { font-size: 0.7rem; color: var(--muted); font-style: italic; margin-top: 0.2rem; }
+    .video-actions { display: flex; gap: 0.5rem; }
+    .icon-btn { background: none; border: 1px solid var(--border); border-radius: 6px; color: var(--muted); cursor: pointer; padding: 0.4rem 0.6rem; font-size: 0.7rem; letter-spacing: 0.1em; transition: all 0.2s; }
+    .icon-btn:hover { border-color: var(--accent); color: var(--accent); }
+    .icon-btn.del:hover { border-color: var(--danger); color: var(--danger); }
+
+    /* SETTINGS MODAL */
+    .modal-overlay { display: none; position: fixed; inset: 0; background: rgba(10,10,15,0.85); z-index: 50; align-items: center; justify-content: center; padding: 1.5rem; backdrop-filter: blur(4px); }
+    .modal-overlay.open { display: flex; }
+    .modal { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; padding: 1.5rem; width: 100%; max-width: 400px; }
+    .modal-title { font-size: 0.7rem; letter-spacing: 0.2em; color: var(--muted); margin-bottom: 1.25rem; }
+    .field { margin-bottom: 1rem; }
+    .field label { display: block; font-size: 0.6rem; letter-spacing: 0.15em; color: var(--muted); margin-bottom: 0.4rem; }
+    .field input { width: 100%; padding: 0.75rem; background: var(--bg); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: inherit; font-size: 0.8rem; }
+    .field input:focus { outline: none; border-color: var(--accent); }
+    .field-hint { font-size: 0.6rem; color: var(--muted); margin-top: 0.3rem; line-height: 1.5; }
+    .modal-actions { display: flex; gap: 0.75rem; margin-top: 1.25rem; }
+    .modal-actions .btn { flex: 1; padding: 0.7rem; }
+
+    /* TOAST */
+    .toast { position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%) translateY(100px); background: var(--surface); border: 1px solid var(--accent); color: var(--accent); padding: 0.75rem 1.5rem; border-radius: 8px; font-size: 0.75rem; letter-spacing: 0.1em; transition: transform 0.3s ease; z-index: 100; white-space: nowrap; }
+    .toast.show { transform: translateX(-50%) translateY(0); }
+  </style>
+</head>
+<body>
+
+<nav>
+  <button class="active" onclick="switchTab('camera')">TRACK</button>
+  <button onclick="switchTab('log')">LOG</button>
+  <button onclick="switchTab('videos')">VIDEOS</button>
+  <button class="gear-btn" onclick="openSettings()">⚙</button>
+</nav>
+
+<!-- TRACK -->
+<div id="camera-view" class="view active">
+  <div class="video-container" id="video-container">
+    <video id="video" autoplay playsinline muted></video>
+    <canvas id="canvas"></canvas>
+    <div class="view-badge" id="view-badge">—</div>
+    <div class="shape-badge" id="shape-badge" style="display:none;"></div>
+  </div>
+
+  <div class="zoom-row" id="zoom-row">
+    <span class="zoom-label">ZOOM</span>
+    <input type="range" class="zoom-slider" id="zoom-slider" min="0.5" max="3" step="0.1" value="1" oninput="applyZoom(this.value)">
+    <span class="zoom-val" id="zoom-val">1×</span>
+    <button class="btn" id="flip-btn" onclick="flipCamera()" style="padding:0.4rem 0.75rem;font-size:0.75rem;">⇄</button>
+  </div>
+
+  <div class="timer-display" id="timer">0.0</div>
+
+  <div class="status-row">
+    <span class="pose-dot" id="pose-dot"></span>
+    <span id="pose-status">waiting for camera...</span>
+  </div>
+  <div class="status-row" id="rec-status" style="display:none;">
+    <span class="rec-dot"></span>
+    <span>recording</span>
+  </div>
+
+  <div id="debug-info"></div>
+
+  <!-- FEEDBACK CARD -->
+  <div class="feedback-card" id="feedback-card">
+    <div class="feedback-header">
+      <span>ANALYSIS</span>
+      <div class="feedback-meta">
+        <span class="shape-tag" id="fb-shape"></span>
+        <span class="view-tag" id="fb-view"></span>
+      </div>
+    </div>
+    <div class="feedback-body">
+      <div class="feedback-placeholder" id="fb-placeholder">hold detected → analyse</div>
+      <div class="feedback-text" id="fb-text" style="display:none;"></div>
+      <div class="feedback-loading" id="fb-loading" style="display:none;">analysing...</div>
+    </div>
+    <img class="feedback-thumb" id="fb-thumb" style="display:none;" alt="hold frame" onclick="expandThumb()">
+  </div>
+
+  <hr class="divider">
+
+  <div class="manual-row">
+    <input type="number" id="manual-seconds" placeholder="manual seconds" min="0" step="0.1">
+    <button class="btn" onclick="logManual()">LOG</button>
+  </div>
+  <textarea class="note-input" id="note" placeholder="notes (optional)..."></textarea>
+
+  <div class="btn-row">
+    <button class="btn primary" onclick="startCamera()" id="cam-btn">START CAMERA</button>
+    <button class="btn" onclick="toggleRecord()" id="rec-btn" style="display:none;">REC</button>
+    <button class="btn" onclick="analyseLastHold()" id="analyse-btn" style="display:none;">ANALYSE</button>
+    <button class="btn" onclick="toggleDebug()" id="debug-btn" style="display:none;font-size:0.65rem;">DEBUG</button>
+  </div>
+</div>
+
+<!-- LOG -->
+<div id="log-view" class="view">
+  <div class="stats-bar" id="stats-bar"></div>
+  <div class="chart-section">
+    <div class="chart-label">BEST HOLD / DAY — 14 DAYS</div>
+    <div class="bar-chart" id="bar-chart"></div>
+  </div>
+  <div class="log-section-header">SESSIONS</div>
+  <div id="entries"></div>
+</div>
+
+<!-- VIDEOS -->
+<div id="videos-view" class="view">
+  <div id="video-list"></div>
+</div>
+
+<!-- SETTINGS -->
+<div class="modal-overlay" id="settings-modal">
+  <div class="modal">
+    <div class="modal-title">SETTINGS</div>
+    <div class="field">
+      <label>ANTHROPIC API KEY</label>
+      <input type="password" id="api-key-input" placeholder="sk-ant-...">
+      <div class="field-hint">Used for post-hold coaching analysis. Stored locally, never sent anywhere except api.anthropic.com.</div>
+    </div>
+    <div class="field">
+      <label>ANALYSIS THRESHOLD (seconds)</label>
+      <input type="number" id="threshold-input" placeholder="3" min="1" step="0.5">
+      <div class="field-hint">Minimum hold duration to enable analysis button.</div>
+    </div>
+    <div class="modal-actions">
+      <button class="btn" onclick="closeSettings()">CANCEL</button>
+      <button class="btn primary" onclick="saveSettings()">SAVE</button>
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+
+<script>
+// ── STATE ──
+let db = JSON.parse(localStorage.getItem('handstand-log') || '[]');
+let holdStart = null, holdDuration = 0, timerInterval = null;
+let isHolding = false, cameraStarted = false, videoEl = null;
+
+// Last hold snapshot (for analysis)
+let lastHoldFrame = null;   // base64 jpeg
+let lastHoldShape = null;   // 'full'|'tuck'|'straddle'
+let lastHoldView = null;    // 'side'|'front'
+let lastHoldDuration = 0;
+let currentShape = null;
+let currentView = null;
+
+// Recording
+let mediaRecorder = null, recChunks = [], isRecording = false;
+let recHolds = [];
+
+// Camera
+let cameraTrack = null;
+let facingMode = 'user';
+let zoomLevel = 1.0;
+let hwZoomMin = 1, hwZoomMax = 1, hwZoomSupported = false;
+
+// ── SETTINGS ──
+function getSetting(key, def) { return localStorage.getItem('hs-' + key) || def; }
+function setSetting(key, val) { localStorage.setItem('hs-' + key, val); }
+
+function openSettings() {
+  document.getElementById('api-key-input').value = getSetting('apiKey', '');
+  document.getElementById('threshold-input').value = getSetting('threshold', '3');
+  document.getElementById('settings-modal').classList.add('open');
+}
+function closeSettings() { document.getElementById('settings-modal').classList.remove('open'); }
+function saveSettings() {
+  setSetting('apiKey', document.getElementById('api-key-input').value.trim());
+  setSetting('threshold', document.getElementById('threshold-input').value || '3');
+  closeSettings();
+  showToast('saved');
+}
+
+// ── INDEXEDDB ──
+let idb = null;
+function openIDB() {
+  return new Promise((res, rej) => {
+    if (idb) return res(idb);
+    const r = indexedDB.open('handstand-videos', 1);
+    r.onupgradeneeded = e => e.target.result.createObjectStore('videos', { keyPath: 'id' });
+    r.onsuccess = e => { idb = e.target.result; res(idb); };
+    r.onerror = rej;
+  });
+}
+function saveVideoDB(rec) {
+  return openIDB().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('videos', 'readwrite');
+    tx.objectStore('videos').put(rec);
+    tx.oncomplete = res; tx.onerror = rej;
+  }));
+}
+function getAllVideos() {
+  return openIDB().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('videos', 'readonly');
+    const r = tx.objectStore('videos').getAll();
+    r.onsuccess = e => res(e.result.sort((a,b) => b.id - a.id));
+    r.onerror = rej;
+  }));
+}
+function deleteVideoDB(id) {
+  return openIDB().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('videos', 'readwrite');
+    tx.objectStore('videos').delete(id);
+    tx.oncomplete = res; tx.onerror = rej;
+  }));
+}
+
+// ── TABS ──
+function switchTab(tab) {
+  ['camera','log','videos'].forEach((t, i) => {
+    document.querySelectorAll('nav button')[i].classList.toggle('active', t === tab);
+  });
+  document.getElementById('camera-view').classList.toggle('active', tab === 'camera');
+  document.getElementById('log-view').classList.toggle('active', tab === 'log');
+  document.getElementById('videos-view').classList.toggle('active', tab === 'videos');
+  if (tab === 'log') renderLog();
+  if (tab === 'videos') renderVideos();
+}
+
+// ── GEOMETRY HELPERS ──
+function angleBetween(a, b, c) {
+  const ba = { x: a.x - b.x, y: a.y - b.y };
+  const bc = { x: c.x - b.x, y: c.y - b.y };
+  const dot = ba.x * bc.x + ba.y * bc.y;
+  const mag = Math.sqrt(ba.x**2 + ba.y**2) * Math.sqrt(bc.x**2 + bc.y**2);
+  if (mag === 0) return 180;
+  return Math.acos(Math.min(1, Math.max(-1, dot / mag))) * 180 / Math.PI;
+}
+
+function lineDeviation(a, b, mid) {
+  // perpendicular distance from mid to line a→b, normalised by frame width
+  const dx = b.x - a.x, dy = b.y - a.y;
+  const len = Math.sqrt(dx*dx + dy*dy);
+  if (len === 0) return 0;
+  return Math.abs((b.x - a.x) * (a.y - mid.y) - (a.x - mid.x) * (b.y - a.y)) / len;
+}
+
+// ── VIEW DETECTION ──
+function detectView(lm) {
+  const spread = Math.abs(lm[11].x - lm[12].x);
+  if (spread < 0.18) return 'side';
+  if (spread > 0.22) return 'front';
+  return 'unknown';
+}
+
+// ── SHAPE DETECTION ──
+// Works in both view modes; angles are view-dependent in accuracy
+function detectShape(lm) {
+  const leftKnee  = angleBetween(lm[23], lm[25], lm[27]); // hip-knee-ankle L
+  const rightKnee = angleBetween(lm[24], lm[26], lm[28]); // hip-knee-ankle R
+  const avgKnee   = (leftKnee + rightKnee) / 2;
+
+  // ankle spread (x-axis) — reliable in front view, less so in side
+  const ankleSpreadX = Math.abs(lm[27].x - lm[28].x);
+  // ankle spread (y-axis) — reliable in side view for straddle
+  const ankleSpreadY = Math.abs(lm[27].y - lm[28].y);
+  const ankleSpread  = Math.max(ankleSpreadX, ankleSpreadY);
+
+  if (avgKnee < 130) return 'tuck';
+  if (ankleSpread > 0.2) return 'straddle';
+  return 'full';
+}
+
+// ── BODY LINE ANALYSIS (side view only) ──
+function analyzeBodyLine(lm) {
+  // wrist → shoulder → hip → ankle should be collinear
+  const wrist    = { x: (lm[15].x + lm[16].x)/2, y: (lm[15].y + lm[16].y)/2 };
+  const shoulder = { x: (lm[11].x + lm[12].x)/2, y: (lm[11].y + lm[12].y)/2 };
+  const hip      = { x: (lm[23].x + lm[24].x)/2, y: (lm[23].y + lm[24].y)/2 };
+  const ankle    = { x: (lm[27].x + lm[28].x)/2, y: (lm[27].y + lm[28].y)/2 };
+
+  const hipDev      = lineDeviation(wrist, ankle, hip);
+  const shoulderDev = lineDeviation(wrist, ankle, shoulder);
+
+  // hip forward of line = banana; hip behind = pike
+  const midlineX = wrist.x + (ankle.x - wrist.x) * ((hip.y - wrist.y) / (ankle.y - wrist.y || 0.001));
+  const banana = hip.x - midlineX; // positive = banana (hip toward camera in side view)
+
+  return { hipDev, shoulderDev, banana };
+}
+
+// ── CAMERA + POSE ──
+async function startCamera() {
+  if (cameraStarted) return;
+  videoEl = document.getElementById('video');
+  const canvas = document.getElementById('canvas');
+  const ctx = canvas.getContext('2d');
+
+  const camBtn = document.getElementById('cam-btn');
+  camBtn.textContent = 'STARTING...';
+  camBtn.disabled = true;
+
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode } });
+    videoEl.srcObject = stream;
+    await new Promise(r => videoEl.onloadedmetadata = r);
+    canvas.width = videoEl.videoWidth;
+    canvas.height = videoEl.videoHeight;
+
+    // Check hardware zoom support
+    cameraTrack = stream.getVideoTracks()[0];
+    const caps = cameraTrack.getCapabilities?.() || {};
+    if (caps.zoom) {
+      hwZoomSupported = true;
+      hwZoomMin = caps.zoom.min;
+      hwZoomMax = caps.zoom.max;
+      const slider = document.getElementById('zoom-slider');
+      slider.min = hwZoomMin;
+      slider.max = hwZoomMax;
+      slider.step = (hwZoomMax - hwZoomMin) / 20;
+      slider.value = hwZoomMin;
+      zoomLevel = hwZoomMin;
+    }
+
+    cameraStarted = true;
+    camBtn.style.display = 'none';
+    document.getElementById('rec-btn').style.display = 'inline-block';
+    document.getElementById('debug-btn').style.display = 'inline-block';
+    document.getElementById('zoom-row').classList.add('visible');
+    document.getElementById('pose-status').textContent = 'loading pose model...';
+
+    const pose = new Pose({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}` });
+    pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
+
+    pose.onResults(results => {
+      ctx.clearRect(0, 0, canvas.width, canvas.height);
+      ctx.save();
+      ctx.scale(-1, 1);
+      if (!hwZoomSupported && zoomLevel !== 1) {
+        // Digital zoom: crop source rect
+        const dz = Math.max(0.1, 1 / zoomLevel);
+        const sw = canvas.width * dz, sh = canvas.height * dz;
+        const sx = (canvas.width - sw) / 2, sy = (canvas.height - sh) / 2;
+        ctx.drawImage(videoEl, sx, sy, sw, sh, -canvas.width, 0, canvas.width, canvas.height);
+      } else {
+        ctx.drawImage(videoEl, -canvas.width, 0, canvas.width, canvas.height);
+      }
+      ctx.restore();
+
+      if (results.poseLandmarks) {
+        const lm = results.poseLandmarks;
+        currentView = detectView(lm);
+        currentShape = detectShape(lm);
+
+        document.getElementById('view-badge').textContent = currentView;
+        const shapeBadge = document.getElementById('shape-badge');
+        if (isHolding) {
+          shapeBadge.textContent = currentShape;
+          shapeBadge.style.display = 'block';
+        } else {
+          shapeBadge.style.display = 'none';
+        }
+
+        drawSkeleton(ctx, lm, canvas.width, canvas.height, currentView);
+        updateHoldState(isHandstand(lm), lm);
+
+        // Debug
+        const dbg = document.getElementById('debug-info');
+        if (dbg && dbg.style.display !== 'none') {
+          const bl = currentView === 'side' ? analyzeBodyLine(lm) : null;
+          const lk = angleBetween(lm[23], lm[25], lm[27]);
+          const rk = angleBetween(lm[24], lm[26], lm[28]);
+          const spread = Math.abs(lm[11].x - lm[12].x);
+          dbg.innerHTML =
+            `view: ${currentView} (shoulder spread ${spread.toFixed(2)})<br>` +
+            `shape: ${currentShape} (knee avg ${((lk+rk)/2).toFixed(0)}°)<br>` +
+            (bl ? `banana dev: ${bl.banana.toFixed(3)} | hip dev: ${bl.hipDev.toFixed(3)}<br>` : '') +
+            `wristY: ${Math.max(lm[15].y,lm[16].y).toFixed(2)} (>0.6)<br>` +
+            `ankleY: ${Math.min(lm[27].y,lm[28].y).toFixed(2)} (<0.45)<br>`;
+        }
+      }
+    });
+
+    const camera = new Camera(videoEl, {
+      onFrame: async () => { await pose.send({ image: videoEl }); },
+      width: 640, height: 480
+    });
+    camera.start();
+    document.getElementById('pose-status').textContent = 'detecting pose...';
+
+  } catch(e) {
+    document.getElementById('pose-status').textContent = 'camera error — use manual log';
+    camBtn.textContent = 'START CAMERA'; camBtn.disabled = false;
+  }
+}
+
+function isHandstand(lm) {
+  const wristY   = Math.max(lm[15].y, lm[16].y);
+  const ankleY   = Math.min(lm[27].y, lm[28].y);
+  const hipY     = (lm[23].y + lm[24].y) / 2;
+  const shoulderY = (lm[11].y + lm[12].y) / 2;
+  return wristY > 0.6 && ankleY < 0.45 && lm[0].y > hipY && shoulderY > hipY;
+}
+
+function drawSkeleton(ctx, lm, w, h, view) {
+  const connections = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28]];
+  ctx.strokeStyle = isHolding ? 'rgba(127,255,178,0.7)' : 'rgba(200,184,255,0.5)';
+  ctx.lineWidth = 2;
+  connections.forEach(([a,b]) => {
+    const pa = lm[a], pb = lm[b];
+    if (pa.visibility > 0.5 && pb.visibility > 0.5) {
+      ctx.beginPath(); ctx.moveTo(pa.x*w, pa.y*h); ctx.lineTo(pb.x*w, pb.y*h); ctx.stroke();
+    }
+  });
+  ctx.fillStyle = isHolding ? 'rgba(127,255,178,0.9)' : 'rgba(200,184,255,0.7)';
+  [11,12,13,14,15,16,23,24,25,26,27,28].forEach(i => {
+    const p = lm[i];
+    if (p.visibility > 0.5) { ctx.beginPath(); ctx.arc(p.x*w, p.y*h, 4, 0, Math.PI*2); ctx.fill(); }
+  });
+
+  // body line overlay in side view during hold
+  if (view === 'side' && isHolding) {
+    const wrist    = { x: (lm[15].x + lm[16].x)/2 * w, y: (lm[15].y + lm[16].y)/2 * h };
+    const shoulder = { x: (lm[11].x + lm[12].x)/2 * w, y: (lm[11].y + lm[12].y)/2 * h };
+    const hip      = { x: (lm[23].x + lm[24].x)/2 * w, y: (lm[23].y + lm[24].y)/2 * h };
+    const ankle    = { x: (lm[27].x + lm[28].x)/2 * w, y: (lm[27].y + lm[28].y)/2 * h };
+
+    // ideal straight line
+    ctx.save();
+    ctx.setLineDash([4,4]);
+    ctx.strokeStyle = 'rgba(255,255,100,0.3)';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(wrist.x, wrist.y); ctx.lineTo(ankle.x, ankle.y);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.restore();
+  }
+}
+
+function updateHoldState(handstand, lm) {
+  const dot = document.getElementById('pose-dot');
+  const status = document.getElementById('pose-status');
+
+  if (handstand && !isHolding) {
+    isHolding = true;
+    holdStart = Date.now();
+    dot.classList.add('active');
+    status.textContent = 'handstand detected — holding';
+    startTimerDisplay();
+  } else if (!handstand && isHolding) {
+    isHolding = false;
+    holdDuration = (Date.now() - holdStart) / 1000;
+    dot.classList.remove('active');
+    status.textContent = 'detecting pose...';
+    stopTimerDisplay();
+    document.getElementById('shape-badge').style.display = 'none';
+
+    if (holdDuration >= 1.0) {
+      // Capture frame at hold end
+      lastHoldFrame = document.getElementById('canvas').toDataURL('image/jpeg', 0.85);
+      lastHoldShape = currentShape;
+      lastHoldView  = currentView;
+      lastHoldDuration = holdDuration;
+
+      if (isRecording) recHolds.push(holdDuration);
+      autoSaveHold(holdDuration);
+      updateFeedbackCard();
+    }
+  }
+}
+
+function updateFeedbackCard() {
+  document.getElementById('fb-placeholder').style.display = 'none';
+  document.getElementById('fb-text').style.display = 'none';
+  document.getElementById('fb-loading').style.display = 'none';
+
+  document.getElementById('fb-shape').textContent = lastHoldShape || '';
+  document.getElementById('fb-view').textContent = lastHoldView || '';
+
+  if (lastHoldFrame) {
+    const thumb = document.getElementById('fb-thumb');
+    thumb.src = lastHoldFrame;
+    thumb.style.display = 'block';
+  }
+
+  const threshold = parseFloat(getSetting('threshold', '3'));
+  const apiKey = getSetting('apiKey', '');
+  const analyseBtn = document.getElementById('analyse-btn');
+
+  if (lastHoldDuration >= threshold && apiKey) {
+    analyseBtn.style.display = 'inline-block';
+    document.getElementById('fb-placeholder').textContent = 'tap ANALYSE for coaching cues';
+    document.getElementById('fb-placeholder').style.display = 'block';
+  } else if (!apiKey) {
+    analyseBtn.style.display = 'none';
+    document.getElementById('fb-placeholder').textContent = 'add API key in ⚙ for analysis';
+    document.getElementById('fb-placeholder').style.display = 'block';
+  } else {
+    analyseBtn.style.display = 'none';
+    document.getElementById('fb-placeholder').textContent = `hold ≥ ${threshold}s to unlock analysis`;
+    document.getElementById('fb-placeholder').style.display = 'block';
+  }
+}
+
+// ── CLAUDE ANALYSIS ──
+async function analyseLastHold() {
+  if (!lastHoldFrame) return;
+  const apiKey = getSetting('apiKey', '');
+  if (!apiKey) { openSettings(); return; }
+
+  const analyseBtn = document.getElementById('analyse-btn');
+  analyseBtn.disabled = true;
+  document.getElementById('fb-placeholder').style.display = 'none';
+  document.getElementById('fb-text').style.display = 'none';
+  document.getElementById('fb-loading').style.display = 'block';
+  document.getElementById('feedback-card').classList.add('has-content');
+
+  const viewNote = lastHoldView === 'side'
+    ? 'The camera is positioned from the side — body line and banana/pike are visible.'
+    : 'The camera is positioned from the front — leg shape and symmetry are visible, but spinal alignment is limited.';
+
+  const prompt = `You are a handstand coach. This is a ${lastHoldDuration.toFixed(1)}s handstand hold in ${lastHoldShape} shape. ${viewNote}
+
+Give 2-3 terse, specific coaching cues. Prioritise the most critical alignment issue. Be direct — no filler, no encouragement, just what to fix. Max 60 words.`;
+
+  try {
+    const res = await fetch('https://api.anthropic.com/v1/messages', {
+      method: 'POST',
+      headers: {
+        'x-api-key': apiKey,
+        'anthropic-version': '2023-06-01',
+        'content-type': 'application/json'
+      },
+      body: JSON.stringify({
+        model: 'claude-haiku-4-5-20251001',
+        max_tokens: 200,
+        messages: [{
+          role: 'user',
+          content: [
+            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: lastHoldFrame.split(',')[1] } },
+            { type: 'text', text: prompt }
+          ]
+        }]
+      })
+    });
+
+    const data = await res.json();
+    const text = data.content?.[0]?.text || data.error?.message || 'no response';
+    document.getElementById('fb-loading').style.display = 'none';
+    document.getElementById('fb-text').textContent = text;
+    document.getElementById('fb-text').style.display = 'block';
+    analyseBtn.style.display = 'none';
+
+  } catch(e) {
+    document.getElementById('fb-loading').style.display = 'none';
+    document.getElementById('fb-placeholder').textContent = 'analysis failed — check API key';
+    document.getElementById('fb-placeholder').style.display = 'block';
+    analyseBtn.disabled = false;
+  }
+}
+
+function expandThumb() {
+  if (!lastHoldFrame) return;
+  const w = window.open();
+  w.document.write(`<img src="${lastHoldFrame}" style="max-width:100%;background:#000;">`);
+}
+
+function startTimerDisplay() {
+  const d = document.getElementById('timer');
+  d.classList.add('holding');
+  timerInterval = setInterval(() => { d.textContent = ((Date.now() - holdStart)/1000).toFixed(1); }, 100);
+}
+function stopTimerDisplay() {
+  clearInterval(timerInterval);
+  const d = document.getElementById('timer');
+  d.classList.remove('holding');
+  d.textContent = holdDuration.toFixed(1);
+}
+function autoSaveHold(seconds) {
+  const note = document.getElementById('note').value.trim();
+  saveEntry(seconds, note, true, lastHoldShape, lastHoldView);
+  document.getElementById('note').value = '';
+}
+
+// ── ZOOM + FLIP ──
+async function applyZoom(val) {
+  zoomLevel = parseFloat(val);
+  document.getElementById('zoom-val').textContent = zoomLevel.toFixed(1) + '×';
+  if (hwZoomSupported && cameraTrack) {
+    try { await cameraTrack.applyConstraints({ advanced: [{ zoom: zoomLevel }] }); }
+    catch(e) { /* fall through to digital zoom */ }
+  }
+  // digital zoom is applied in drawImage each frame
+}
+
+async function flipCamera() {
+  if (!cameraStarted) return;
+  facingMode = facingMode === 'user' ? 'environment' : 'user';
+
+  // Stop existing track
+  if (cameraTrack) cameraTrack.stop();
+
+  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode } });
+  videoEl.srcObject = stream;
+  cameraTrack = stream.getVideoTracks()[0];
+
+  // Re-check zoom support on new camera
+  const caps = cameraTrack.getCapabilities?.() || {};
+  hwZoomSupported = !!caps.zoom;
+  if (hwZoomSupported) {
+    hwZoomMin = caps.zoom.min; hwZoomMax = caps.zoom.max;
+    const slider = document.getElementById('zoom-slider');
+    slider.min = hwZoomMin; slider.max = hwZoomMax;
+    slider.step = (hwZoomMax - hwZoomMin) / 20;
+    slider.value = hwZoomMin;
+    zoomLevel = hwZoomMin;
+    document.getElementById('zoom-val').textContent = zoomLevel.toFixed(1) + '×';
+  }
+
+  // Mirror canvas only for front camera
+  document.getElementById('canvas').style.transform = facingMode === 'user' ? 'scaleX(-1)' : 'scaleX(1)';
+}
+
+// ── RECORDING ──
+function toggleRecord() {
+  if (isRecording) stopRecord(); else startRecord();
+}
+function startRecord() {
+  const canvas = document.getElementById('canvas');
+  const stream = canvas.captureStream(30);
+  const mimeType = ['video/webm;codecs=vp9','video/webm','video/mp4'].find(t => MediaRecorder.isTypeSupported(t)) || '';
+  try { mediaRecorder = new MediaRecorder(stream, mimeType ? { mimeType } : {}); }
+  catch(e) { showToast('recording not supported'); return; }
+  recChunks = []; recHolds = [];
+  mediaRecorder.ondataavailable = e => { if (e.data.size > 0) recChunks.push(e.data); };
+  mediaRecorder.onstop = finishRecord;
+  mediaRecorder.start(1000);
+  isRecording = true;
+  document.getElementById('rec-btn').textContent = 'STOP REC';
+  document.getElementById('rec-btn').classList.add('rec-active');
+  document.getElementById('rec-status').style.display = 'flex';
+  document.getElementById('video-container').classList.add('recording');
+}
+function stopRecord() {
+  if (mediaRecorder?.state !== 'inactive') mediaRecorder.stop();
+  isRecording = false;
+  document.getElementById('rec-btn').textContent = 'REC';
+  document.getElementById('rec-btn').classList.remove('rec-active');
+  document.getElementById('rec-status').style.display = 'none';
+  document.getElementById('video-container').classList.remove('recording');
+}
+async function finishRecord() {
+  const blob = new Blob(recChunks, { type: recChunks[0]?.type || 'video/webm' });
+  const note = document.getElementById('note').value.trim();
+  const best = recHolds.length ? Math.max(...recHolds) : 0;
+  try {
+    await saveVideoDB({ id: Date.now(), ts: new Date().toISOString(), blob, note, holds: recHolds, best, size: blob.size });
+    showToast(`video saved · ${recHolds.length} holds`);
+  } catch(e) { showToast('video save failed (storage full?)'); }
+}
+
+// ── MANUAL LOG ──
+function logManual() {
+  const val = parseFloat(document.getElementById('manual-seconds').value);
+  if (!val || val <= 0) { showToast('enter seconds'); return; }
+  const note = document.getElementById('note').value.trim();
+  saveEntry(val, note, false, null, null);
+  document.getElementById('manual-seconds').value = '';
+  document.getElementById('note').value = '';
+}
+
+// ── DATA ──
+function saveEntry(seconds, note, auto, shape, view) {
+  const entry = { id: Date.now(), seconds: Math.round(seconds*10)/10, note, auto, shape, view, ts: new Date().toISOString() };
+  db.unshift(entry);
+  persist();
+  showToast(`saved ${entry.seconds}s`);
+}
+function deleteEntry(id) { db = db.filter(e => e.id !== id); persist(); renderLog(); }
+function persist() { localStorage.setItem('handstand-log', JSON.stringify(db)); }
+
+// ── RENDER LOG ──
+function renderLog() { renderStats(); renderChart(); renderEntries(); }
+
+function renderStats() {
+  if (!db.length) { document.getElementById('stats-bar').innerHTML = ''; return; }
+  const best = Math.max(...db.map(e => e.seconds));
+  const streak = calcStreak();
+  const days = new Set(db.map(e => e.ts.slice(0,10))).size;
+  document.getElementById('stats-bar').innerHTML = `
+    <div class="stat-cell"><div class="stat-val">${best}s</div><div class="stat-label">BEST</div></div>
+    <div class="stat-cell"><div class="stat-val">${streak}</div><div class="stat-label">STREAK</div></div>
+    <div class="stat-cell"><div class="stat-val">${days}</div><div class="stat-label">DAYS</div></div>`;
+}
+
+function calcStreak() {
+  const days = [...new Set(db.map(e => e.ts.slice(0,10)))].sort().reverse();
+  if (!days.length) return 0;
+  let streak = 0, cur = new Date(); cur.setHours(0,0,0,0);
+  for (const d of days) {
+    const day = new Date(d); day.setHours(0,0,0,0);
+    const diff = Math.round((cur - day) / 86400000);
+    if (diff === 0 || diff === 1) { streak++; cur = day; } else break;
+  }
+  return streak;
+}
+
+function renderChart() {
+  const today = new Date(); today.setHours(0,0,0,0);
+  const days = Array.from({length:14}, (_,i) => { const d = new Date(today); d.setDate(d.getDate()-(13-i)); return d; });
+  const bestByDay = {};
+  db.forEach(e => { const d = e.ts.slice(0,10); bestByDay[d] = Math.max(bestByDay[d]||0, e.seconds); });
+  const maxVal = Math.max(...Object.values(bestByDay), 1);
+  document.getElementById('bar-chart').innerHTML = days.map(d => {
+    const key = d.toISOString().slice(0,10);
+    const val = bestByDay[key] || 0;
+    const h = Math.max((val/maxVal)*52, val>0?4:0);
+    const isToday = key === today.toISOString().slice(0,10);
+    return `<div class="bar-col"><div class="bar ${isToday?'today':''}" style="height:${h}px" title="${val}s"></div><div class="bar-day">${d.toLocaleDateString('en',{weekday:'narrow'})}</div></div>`;
+  }).join('');
+}
+
+function renderEntries() {
+  const container = document.getElementById('entries');
+  if (!db.length) { container.innerHTML = '<div class="empty-state">no holds yet<br>start tracking</div>'; return; }
+  const groups = {};
+  db.forEach(e => { const d = e.ts.slice(0,10); if (!groups[d]) groups[d]=[]; groups[d].push(e); });
+  container.innerHTML = Object.entries(groups).sort(([a],[b]) => b.localeCompare(a)).map(([date, entries]) => {
+    const best = Math.max(...entries.map(e => e.seconds));
+    const label = new Date(date).toLocaleDateString('en',{weekday:'short',month:'short',day:'numeric'}).toUpperCase();
+    return `<div class="session-group">
+      <div class="session-date"><span>${label}</span><span class="session-best">best ${best}s</span></div>
+      ${entries.map(e => `
+        <div class="entry">
+          <div class="entry-time">${e.seconds}s</div>
+          <div class="entry-detail">
+            <div class="entry-label">${e.auto?'AUTO':'MANUAL'}${e.shape?' · '+e.shape:''}${e.view?' · '+e.view:''} · ${new Date(e.ts).toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit'})}</div>
+            ${e.note?`<div class="entry-note">${e.note}</div>`:''}
+          </div>
+          <button class="entry-delete" onclick="deleteEntry(${e.id})">×</button>
+        </div>`).join('')}
+    </div>`;
+  }).join('');
+}
+
+// ── RENDER VIDEOS ──
+async function renderVideos() {
+  const container = document.getElementById('video-list');
+  container.innerHTML = '<div class="empty-state">loading...</div>';
+  try {
+    const videos = await getAllVideos();
+    if (!videos.length) { container.innerHTML = '<div class="empty-state">no recordings yet<br>hit REC while tracking</div>'; return; }
+    container.innerHTML = '';
+    videos.forEach(v => {
+      const url = URL.createObjectURL(v.blob);
+      const date = new Date(v.ts).toLocaleDateString('en',{weekday:'short',month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
+      const sizeMB = (v.size/1048576).toFixed(1);
+      const card = document.createElement('div');
+      card.className = 'video-card';
+      card.innerHTML = `
+        <video src="${url}" controls playsinline preload="metadata"></video>
+        <div class="video-meta">
+          <div class="video-info">
+            <div class="video-date">${date} · ${sizeMB}MB</div>
+            <div class="video-duration">${v.holds.length} holds${v.best?' · best '+v.best+'s':''}</div>
+            ${v.note?`<div class="video-note">${v.note}</div>`:''}
+          </div>
+          <div class="video-actions">
+            <button class="icon-btn" onclick="downloadVideo('${url}',${v.id})">↓</button>
+            <button class="icon-btn del" onclick="removeVideo(${v.id},this)">×</button>
+          </div>
+        </div>`;
+      container.appendChild(card);
+    });
+  } catch(e) { container.innerHTML = '<div class="empty-state">could not load videos</div>'; }
+}
+
+function downloadVideo(url, id) {
+  const a = document.createElement('a'); a.href = url; a.download = `handstand-${id}.webm`; a.click();
+}
+async function removeVideo(id, btn) {
+  btn.disabled = true; await deleteVideoDB(id); renderVideos(); showToast('deleted');
+}
+
+// ── TOAST ──
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg; t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// ── DEBUG ──
+function toggleDebug() {
+  const d = document.getElementById('debug-info'), btn = document.getElementById('debug-btn');
+  const vis = d.style.display !== 'none';
+  d.style.display = vis ? 'none' : 'block';
+  btn.textContent = vis ? 'DEBUG' : 'HIDE DEBUG';
+}
+
+renderLog();
+</script>
+</body>
+</html>
