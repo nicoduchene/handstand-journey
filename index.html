@@ -457,16 +457,23 @@ async function startCamera() {
     // Check hardware zoom support
     cameraTrack = stream.getVideoTracks()[0];
     const caps = cameraTrack.getCapabilities?.() || {};
+    const slider = document.getElementById('zoom-slider');
     if (caps.zoom) {
       hwZoomSupported = true;
       hwZoomMin = caps.zoom.min;
       hwZoomMax = caps.zoom.max;
-      const slider = document.getElementById('zoom-slider');
       slider.min = hwZoomMin;
       slider.max = hwZoomMax;
       slider.step = (hwZoomMax - hwZoomMin) / 20;
       slider.value = hwZoomMin;
       zoomLevel = hwZoomMin;
+    } else {
+      // Digital zoom only supports >= 1x (cropping in)
+      slider.min = 1;
+      slider.max = 3;
+      slider.step = 0.1;
+      slider.value = 1;
+      zoomLevel = 1;
     }
 
     cameraStarted = true;
@@ -483,11 +490,11 @@ async function startCamera() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       ctx.save();
       ctx.scale(-1, 1);
-      if (!hwZoomSupported && zoomLevel !== 1) {
-        // Digital zoom: crop source rect
-        const dz = Math.max(0.1, 1 / zoomLevel);
-        const sw = canvas.width * dz, sh = canvas.height * dz;
-        const sx = (canvas.width - sw) / 2, sy = (canvas.height - sh) / 2;
+      if (!hwZoomSupported && zoomLevel > 1) {
+        // Digital zoom in: crop center of source
+        const dz = 1 / zoomLevel;
+        const sw = videoEl.videoWidth * dz, sh = videoEl.videoHeight * dz;
+        const sx = (videoEl.videoWidth - sw) / 2, sy = (videoEl.videoHeight - sh) / 2;
         ctx.drawImage(videoEl, sx, sy, sw, sh, -canvas.width, 0, canvas.width, canvas.height);
       } else {
         ctx.drawImage(videoEl, -canvas.width, 0, canvas.width, canvas.height);
@@ -529,8 +536,14 @@ async function startCamera() {
     });
 
     const camera = new Camera(videoEl, {
-      onFrame: async () => { await pose.send({ image: videoEl }); },
-      width: 640, height: 480
+      onFrame: async () => {
+        // Keep canvas in sync with actual video dimensions
+        if (canvas.width !== videoEl.videoWidth || canvas.height !== videoEl.videoHeight) {
+          canvas.width = videoEl.videoWidth;
+          canvas.height = videoEl.videoHeight;
+        }
+        await pose.send({ image: videoEl });
+      }
     });
     camera.start();
     document.getElementById('pose-status').textContent = 'detecting pose...';
@@ -556,21 +569,21 @@ function drawSkeleton(ctx, lm, w, h, view) {
   connections.forEach(([a,b]) => {
     const pa = lm[a], pb = lm[b];
     if (pa.visibility > 0.5 && pb.visibility > 0.5) {
-      ctx.beginPath(); ctx.moveTo(pa.x*w, pa.y*h); ctx.lineTo(pb.x*w, pb.y*h); ctx.stroke();
+      ctx.beginPath(); ctx.moveTo((1-pa.x)*w, pa.y*h); ctx.lineTo((1-pb.x)*w, pb.y*h); ctx.stroke();
     }
   });
   ctx.fillStyle = isHolding ? 'rgba(127,255,178,0.9)' : 'rgba(200,184,255,0.7)';
   [11,12,13,14,15,16,23,24,25,26,27,28].forEach(i => {
     const p = lm[i];
-    if (p.visibility > 0.5) { ctx.beginPath(); ctx.arc(p.x*w, p.y*h, 4, 0, Math.PI*2); ctx.fill(); }
+    if (p.visibility > 0.5) { ctx.beginPath(); ctx.arc((1-p.x)*w, p.y*h, 4, 0, Math.PI*2); ctx.fill(); }
   });
 
   // body line overlay in side view during hold
   if (view === 'side' && isHolding) {
-    const wrist    = { x: (lm[15].x + lm[16].x)/2 * w, y: (lm[15].y + lm[16].y)/2 * h };
-    const shoulder = { x: (lm[11].x + lm[12].x)/2 * w, y: (lm[11].y + lm[12].y)/2 * h };
-    const hip      = { x: (lm[23].x + lm[24].x)/2 * w, y: (lm[23].y + lm[24].y)/2 * h };
-    const ankle    = { x: (lm[27].x + lm[28].x)/2 * w, y: (lm[27].y + lm[28].y)/2 * h };
+    const wrist    = { x: (1 - (lm[15].x + lm[16].x)/2) * w, y: (lm[15].y + lm[16].y)/2 * h };
+    const shoulder = { x: (1 - (lm[11].x + lm[12].x)/2) * w, y: (lm[11].y + lm[12].y)/2 * h };
+    const hip      = { x: (1 - (lm[23].x + lm[24].x)/2) * w, y: (lm[23].y + lm[24].y)/2 * h };
+    const ankle    = { x: (1 - (lm[27].x + lm[28].x)/2) * w, y: (lm[27].y + lm[28].y)/2 * h };
 
     // ideal straight line
     ctx.save();
@@ -744,28 +757,37 @@ async function flipCamera() {
   if (!cameraStarted) return;
   facingMode = facingMode === 'user' ? 'environment' : 'user';
 
-  // Stop existing track
-  if (cameraTrack) cameraTrack.stop();
+  // Stop existing tracks
+  if (videoEl.srcObject) videoEl.srcObject.getTracks().forEach(t => t.stop());
 
-  const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode } });
-  videoEl.srcObject = stream;
-  cameraTrack = stream.getVideoTracks()[0];
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ video: { facingMode } });
+    videoEl.srcObject = stream;
+    cameraTrack = stream.getVideoTracks()[0];
 
-  // Re-check zoom support on new camera
-  const caps = cameraTrack.getCapabilities?.() || {};
-  hwZoomSupported = !!caps.zoom;
-  if (hwZoomSupported) {
-    hwZoomMin = caps.zoom.min; hwZoomMax = caps.zoom.max;
+    // Re-check zoom support
+    const caps = cameraTrack.getCapabilities?.() || {};
     const slider = document.getElementById('zoom-slider');
-    slider.min = hwZoomMin; slider.max = hwZoomMax;
-    slider.step = (hwZoomMax - hwZoomMin) / 20;
-    slider.value = hwZoomMin;
-    zoomLevel = hwZoomMin;
+    if (caps.zoom) {
+      hwZoomSupported = true;
+      hwZoomMin = caps.zoom.min; hwZoomMax = caps.zoom.max;
+      slider.min = hwZoomMin; slider.max = hwZoomMax;
+      slider.step = (hwZoomMax - hwZoomMin) / 20;
+      slider.value = hwZoomMin;
+      zoomLevel = hwZoomMin;
+    } else {
+      hwZoomSupported = false;
+      slider.min = 1; slider.max = 3; slider.step = 0.1;
+      slider.value = 1; zoomLevel = 1;
+    }
     document.getElementById('zoom-val').textContent = zoomLevel.toFixed(1) + '×';
-  }
 
-  // Mirror canvas only for front camera
-  document.getElementById('canvas').style.transform = facingMode === 'user' ? 'scaleX(-1)' : 'scaleX(1)';
+    // Mirror only for front camera
+    document.getElementById('canvas').style.transform = facingMode === 'user' ? 'scaleX(-1)' : 'scaleX(1)';
+  } catch(e) {
+    showToast('could not switch camera');
+    facingMode = facingMode === 'user' ? 'environment' : 'user'; // revert
+  }
 }
 
 // ── RECORDING ──
