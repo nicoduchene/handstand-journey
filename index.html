@@ -6,7 +6,8 @@
   <meta name="theme-color" content="#0a0a0f">
   <meta name="apple-mobile-web-app-capable" content="yes">
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
-  <link rel="manifest" href="manifest.json?v=2">
+  <link rel="manifest" href="manifest.json?v=3">
+  <link rel="apple-touch-icon" href="icon.svg">
   <title>Handstand</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -350,7 +351,7 @@ function getAllVideos() {
   return openIDB().then(db => new Promise((res, rej) => {
     const tx = db.transaction('videos', 'readonly');
     const r = tx.objectStore('videos').getAll();
-    r.onsuccess = e => res(e.result.sort((a,b) => b.id - a.id));
+    r.onsuccess = e => res(e.target.result.sort((a,b) => b.id - a.id));
     r.onerror = rej;
   }));
 }
@@ -968,5 +969,6 @@ function toggleDebug() {
 
 renderLog();
 </script>
+<script>if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');</script>
 </body>
 </html>
