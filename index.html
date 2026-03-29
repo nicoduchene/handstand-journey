@@ -565,7 +565,7 @@ function isHandstand(lm) {
 
 function drawSkeleton(ctx, lm, w, h, view) {
   const connections = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28]];
-  ctx.strokeStyle = isHolding ? 'rgba(127,255,178,0.7)' : 'rgba(200,184,255,0.5)';
+  ctx.strokeStyle = isHolding ? 'rgba(255,0,255,0.7)' : 'rgba(255,0,255,0.5)';
   ctx.lineWidth = 2;
   connections.forEach(([a,b]) => {
     const pa = lm[a], pb = lm[b];
@@ -573,7 +573,7 @@ function drawSkeleton(ctx, lm, w, h, view) {
       ctx.beginPath(); ctx.moveTo((1-pa.x)*w, pa.y*h); ctx.lineTo((1-pb.x)*w, pb.y*h); ctx.stroke();
     }
   });
-  ctx.fillStyle = isHolding ? 'rgba(127,255,178,0.9)' : 'rgba(200,184,255,0.7)';
+  ctx.fillStyle = isHolding ? 'rgba(255,0,255,0.9)' : 'rgba(255,0,255,0.7)';
   [11,12,13,14,15,16,23,24,25,26,27,28].forEach(i => {
     const p = lm[i];
     if (p.visibility > 0.5) { ctx.beginPath(); ctx.arc((1-p.x)*w, p.y*h, 4, 0, Math.PI*2); ctx.fill(); }
