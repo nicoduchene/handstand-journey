@@ -101,6 +101,22 @@
     .feedback-thumb { width: 100%; display: block; opacity: 0.6; cursor: pointer; transition: opacity 0.2s; border-top: 1px solid var(--border); }
     .feedback-thumb:hover { opacity: 0.9; }
 
+    .frame-carousel { position: relative; width: 100%; overflow: hidden; touch-action: pan-y; border-top: 1px solid var(--border); }
+    .frame-track { display: flex; transition: transform 0.25s ease; }
+    .frame-slide { min-width: 100%; position: relative; }
+    .frame-slide img { width: 100%; display: block; opacity: 0.7; cursor: pointer; }
+    .frame-slide img:hover { opacity: 0.95; }
+    .frame-label {
+      position: absolute; bottom: 0.5rem; left: 50%; transform: translateX(-50%);
+      background: rgba(10,10,15,0.8); border: 1px solid var(--border);
+      border-radius: 4px; padding: 0.15rem 0.5rem;
+      font-size: 0.55rem; letter-spacing: 0.15em; color: var(--accent);
+      backdrop-filter: blur(4px); pointer-events: none;
+    }
+    .frame-dots { display: flex; justify-content: center; gap: 6px; padding: 0.4rem 0; }
+    .frame-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--border); transition: background 0.2s; }
+    .frame-dot.active { background: var(--accent); }
+
     .btn { padding: 0.8rem 2rem; border-radius: 8px; border: 1px solid var(--border); background: var(--surface); color: var(--text); font-family: inherit; font-size: 0.8rem; letter-spacing: 0.1em; cursor: pointer; transition: all 0.2s; }
     .btn:hover { border-color: var(--accent); color: var(--accent); }
     .btn.primary { background: var(--accent-dim); border-color: var(--accent); color: var(--accent); }
@@ -227,7 +243,10 @@
       <div class="feedback-text" id="fb-text" style="display:none;"></div>
       <div class="feedback-loading" id="fb-loading" style="display:none;">analysing...</div>
     </div>
-    <img class="feedback-thumb" id="fb-thumb" style="display:none;" alt="hold frame" onclick="expandThumb()">
+    <div class="frame-carousel" id="frame-carousel" style="display:none;">
+      <div class="frame-track" id="frame-track"></div>
+      <div class="frame-dots" id="frame-dots"></div>
+    </div>
   </div>
 
   <hr class="divider">
@@ -684,11 +703,32 @@ function updateFeedbackCard() {
   document.getElementById('fb-shape').textContent = lastHoldShape || '';
   document.getElementById('fb-view').textContent = lastHoldView || '';
 
-  const bestEntry = lastHoldFrames[lastHoldShape];
-  if (bestEntry) {
-    const thumb = document.getElementById('fb-thumb');
-    thumb.src = bestEntry.frame;
-    thumb.style.display = 'block';
+  const shapes = Object.keys(lastHoldFrames);
+  const carousel = document.getElementById('frame-carousel');
+  const track = document.getElementById('frame-track');
+  const dots = document.getElementById('frame-dots');
+  track.innerHTML = '';
+  dots.innerHTML = '';
+
+  if (shapes.length > 0) {
+    shapes.forEach((shape, i) => {
+      const entry = lastHoldFrames[shape];
+      const slide = document.createElement('div');
+      slide.className = 'frame-slide';
+      slide.innerHTML = `<img src="${entry.frame}" alt="${shape}" onclick="expandFrame(${i})"><div class="frame-label">${shape} · ${entry.view} · ${entry.score.toFixed(3)}</div>`;
+      track.appendChild(slide);
+
+      const dot = document.createElement('div');
+      dot.className = 'frame-dot' + (i === 0 ? ' active' : '');
+      dot.onclick = () => goToFrame(i);
+      dots.appendChild(dot);
+    });
+    carousel.style.display = 'block';
+    carouselIndex = 0;
+    carouselShapes = shapes;
+    initCarouselSwipe();
+  } else {
+    carousel.style.display = 'none';
   }
 
   const threshold = parseFloat(getSetting('threshold', '3'));
@@ -779,11 +819,56 @@ Give 2-3 terse, specific coaching cues. Prioritise the most critical alignment i
   }
 }
 
-function expandThumb() {
-  const bestEntry = lastHoldFrames[lastHoldShape];
-  if (!bestEntry) return;
+// ── FRAME CAROUSEL ──
+let carouselIndex = 0;
+let carouselShapes = [];
+
+function goToFrame(i) {
+  carouselIndex = i;
+  const track = document.getElementById('frame-track');
+  track.style.transform = `translateX(-${i * 100}%)`;
+  document.querySelectorAll('#frame-dots .frame-dot').forEach((d, j) => d.classList.toggle('active', j === i));
+  // Update header tags to match current frame
+  const shape = carouselShapes[i];
+  const entry = lastHoldFrames[shape];
+  if (entry) {
+    document.getElementById('fb-shape').textContent = shape;
+    document.getElementById('fb-view').textContent = entry.view;
+  }
+}
+
+function expandFrame(i) {
+  const shape = carouselShapes[i];
+  const entry = lastHoldFrames[shape];
+  if (!entry) return;
   const w = window.open();
-  w.document.write(`<img src="${bestEntry.frame}" style="max-width:100%;background:#000;">`);
+  w.document.write(`<img src="${entry.frame}" style="max-width:100%;background:#000;">`);
+}
+
+function initCarouselSwipe() {
+  const carousel = document.getElementById('frame-carousel');
+  let startX = 0, dragging = false;
+
+  carousel.ontouchstart = e => { startX = e.touches[0].clientX; dragging = true; };
+  carousel.ontouchmove = e => { if (!dragging) return; e.preventDefault(); };
+  carousel.ontouchend = e => {
+    if (!dragging) return;
+    dragging = false;
+    const dx = e.changedTouches[0].clientX - startX;
+    if (Math.abs(dx) < 40) return;
+    if (dx < 0 && carouselIndex < carouselShapes.length - 1) goToFrame(carouselIndex + 1);
+    else if (dx > 0 && carouselIndex > 0) goToFrame(carouselIndex - 1);
+  };
+  // Mouse fallback
+  carousel.onmousedown = e => { startX = e.clientX; dragging = true; };
+  carousel.onmouseup = e => {
+    if (!dragging) return;
+    dragging = false;
+    const dx = e.clientX - startX;
+    if (Math.abs(dx) < 40) return;
+    if (dx < 0 && carouselIndex < carouselShapes.length - 1) goToFrame(carouselIndex + 1);
+    else if (dx > 0 && carouselIndex > 0) goToFrame(carouselIndex - 1);
+  };
 }
 
 function startTimerDisplay() {
