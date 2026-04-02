@@ -295,12 +295,18 @@ let holdStart = null, holdDuration = 0, timerInterval = null;
 let isHolding = false, cameraStarted = false, videoEl = null;
 
 // Last hold snapshot (for analysis)
-let lastHoldFrame = null;   // base64 jpeg
-let lastHoldShape = null;   // 'full'|'tuck'|'straddle'
+let lastHoldFrames = {};    // { shape: { frame, score, view } } — best frame per shape
+let lastHoldShape = null;   // dominant shape (longest held)
 let lastHoldView = null;    // 'side'|'front'
 let lastHoldDuration = 0;
 let currentShape = null;
 let currentView = null;
+
+// Frame sampling during hold
+let holdFrameCandidates = {};  // { shape: { frame, score, view } }
+let holdShapeTimes = {};       // { shape: totalMs } — tracks time in each shape
+let lastSampleTime = 0;
+let lastShapeChangeTime = 0;
 
 // Recording
 let mediaRecorder = null, recChunks = [], isRecording = false;
@@ -565,7 +571,7 @@ function isHandstand(lm) {
 
 function drawSkeleton(ctx, lm, w, h, view) {
   const connections = [[11,12],[11,13],[13,15],[12,14],[14,16],[11,23],[12,24],[23,24],[23,25],[24,26],[25,27],[26,28]];
-  ctx.strokeStyle = isHolding ? 'rgba(255,0,255,0.7)' : 'rgba(255,0,255,0.5)';
+  ctx.strokeStyle = isHolding ? 'rgba(127,255,178,0.8)' : 'rgba(100,180,255,0.5)';
   ctx.lineWidth = 2;
   connections.forEach(([a,b]) => {
     const pa = lm[a], pb = lm[b];
@@ -598,6 +604,36 @@ function drawSkeleton(ctx, lm, w, h, view) {
   }
 }
 
+function scoreFrame(lm) {
+  // Lower = better alignment. Uses body line deviation from wrist-ankle line.
+  const bl = analyzeBodyLine(lm);
+  return Math.abs(bl.hipDev) + Math.abs(bl.shoulderDev);
+}
+
+function sampleHoldFrame(lm) {
+  const now = Date.now();
+  if (now - lastSampleTime < 500) return; // sample every 0.5s
+  lastSampleTime = now;
+
+  const shape = currentShape;
+  const view = currentView;
+  const score = scoreFrame(lm);
+  const prev = holdFrameCandidates[shape];
+
+  if (!prev || score < prev.score) {
+    holdFrameCandidates[shape] = {
+      frame: document.getElementById('canvas').toDataURL('image/jpeg', 0.85),
+      score,
+      view
+    };
+  }
+
+  // Track time per shape
+  if (!holdShapeTimes[shape]) holdShapeTimes[shape] = 0;
+  holdShapeTimes[shape] += now - (lastShapeChangeTime || now);
+  lastShapeChangeTime = now;
+}
+
 function updateHoldState(handstand, lm) {
   const dot = document.getElementById('pose-dot');
   const status = document.getElementById('pose-status');
@@ -605,9 +641,16 @@ function updateHoldState(handstand, lm) {
   if (handstand && !isHolding) {
     isHolding = true;
     holdStart = Date.now();
+    holdFrameCandidates = {};
+    holdShapeTimes = {};
+    lastSampleTime = 0;
+    lastShapeChangeTime = Date.now();
     dot.classList.add('active');
     status.textContent = 'handstand detected — holding';
     startTimerDisplay();
+  } else if (handstand && isHolding) {
+    // Mid-hold: sample frames
+    sampleHoldFrame(lm);
   } else if (!handstand && isHolding) {
     isHolding = false;
     holdDuration = (Date.now() - holdStart) / 1000;
@@ -617,11 +660,14 @@ function updateHoldState(handstand, lm) {
     document.getElementById('shape-badge').style.display = 'none';
 
     if (holdDuration >= 1.0) {
-      // Capture frame at hold end
-      lastHoldFrame = document.getElementById('canvas').toDataURL('image/jpeg', 0.85);
-      lastHoldShape = currentShape;
-      lastHoldView  = currentView;
+      // Finalize best frames per shape
+      lastHoldFrames = holdFrameCandidates;
       lastHoldDuration = holdDuration;
+
+      // Dominant shape = most time spent
+      const dominant = Object.entries(holdShapeTimes).sort((a,b) => b[1] - a[1])[0];
+      lastHoldShape = dominant ? dominant[0] : currentShape;
+      lastHoldView = lastHoldFrames[lastHoldShape]?.view || currentView;
 
       if (isRecording) recHolds.push(holdDuration);
       autoSaveHold(holdDuration);
@@ -638,9 +684,10 @@ function updateFeedbackCard() {
   document.getElementById('fb-shape').textContent = lastHoldShape || '';
   document.getElementById('fb-view').textContent = lastHoldView || '';
 
-  if (lastHoldFrame) {
+  const bestEntry = lastHoldFrames[lastHoldShape];
+  if (bestEntry) {
     const thumb = document.getElementById('fb-thumb');
-    thumb.src = lastHoldFrame;
+    thumb.src = bestEntry.frame;
     thumb.style.display = 'block';
   }
 
@@ -665,7 +712,8 @@ function updateFeedbackCard() {
 
 // ── CLAUDE ANALYSIS ──
 async function analyseLastHold() {
-  if (!lastHoldFrame) return;
+  const shapes = Object.keys(lastHoldFrames);
+  if (shapes.length === 0) return;
   const apiKey = getSetting('apiKey', '');
   if (!apiKey) { openSettings(); return; }
 
@@ -680,7 +728,20 @@ async function analyseLastHold() {
     ? 'The camera is positioned from the side — body line and banana/pike are visible.'
     : 'The camera is positioned from the front — leg shape and symmetry are visible, but spinal alignment is limited.';
 
-  const prompt = `You are a handstand coach. This is a ${lastHoldDuration.toFixed(1)}s handstand hold in ${lastHoldShape} shape. ${viewNote}
+  // Build image content — one best frame per shape
+  const imageContent = shapes.map(shape => {
+    const entry = lastHoldFrames[shape];
+    return [
+      { type: 'text', text: `[Best frame — ${shape} shape, ${entry.view} view, alignment score ${entry.score.toFixed(3)}]` },
+      { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: entry.frame.split(',')[1] } }
+    ];
+  }).flat();
+
+  const shapeSummary = shapes.length > 1
+    ? `Shapes observed: ${shapes.join(', ')}. Dominant shape: ${lastHoldShape}.`
+    : `Shape: ${lastHoldShape}.`;
+
+  const prompt = `You are a handstand coach. This is a ${lastHoldDuration.toFixed(1)}s handstand hold. ${shapeSummary} ${viewNote}
 
 Give 2-3 terse, specific coaching cues. Prioritise the most critical alignment issue. Be direct — no filler, no encouragement, just what to fix. Max 60 words.`;
 
@@ -690,17 +751,15 @@ Give 2-3 terse, specific coaching cues. Prioritise the most critical alignment i
       headers: {
         'x-api-key': apiKey,
         'anthropic-version': '2023-06-01',
-        'content-type': 'application/json'
+        'content-type': 'application/json',
+        'anthropic-dangerous-direct-browser-access': 'true'
       },
       body: JSON.stringify({
-        model: 'claude-haiku-4-5-20251001',
+        model: 'claude-3-5-haiku-20241022',
         max_tokens: 200,
         messages: [{
           role: 'user',
-          content: [
-            { type: 'image', source: { type: 'base64', media_type: 'image/jpeg', data: lastHoldFrame.split(',')[1] } },
-            { type: 'text', text: prompt }
-          ]
+          content: [...imageContent, { type: 'text', text: prompt }]
         }]
       })
     });
@@ -721,9 +780,10 @@ Give 2-3 terse, specific coaching cues. Prioritise the most critical alignment i
 }
 
 function expandThumb() {
-  if (!lastHoldFrame) return;
+  const bestEntry = lastHoldFrames[lastHoldShape];
+  if (!bestEntry) return;
   const w = window.open();
-  w.document.write(`<img src="${lastHoldFrame}" style="max-width:100%;background:#000;">`);
+  w.document.write(`<img src="${bestEntry.frame}" style="max-width:100%;background:#000;">`);
 }
 
 function startTimerDisplay() {
