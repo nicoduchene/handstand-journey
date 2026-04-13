@@ -327,6 +327,9 @@ let holdShapeTimes = {};       // { shape: totalMs } — tracks time in each sha
 let lastSampleTime = 0;
 let lastShapeChangeTime = 0;
 
+// Biomechanics
+let lastHoldBio = null;
+
 // Recording
 let mediaRecorder = null, recChunks = [], isRecording = false;
 let recHolds = [];
@@ -462,6 +465,140 @@ function analyzeBodyLine(lm) {
   return { hipDev, shoulderDev, banana };
 }
 
+// ── BIOMECHANICS ENGINE ──
+// Body segment mass fractions and COM positions (de Leva 1996, male)
+const BODY_SEGMENTS = [
+  // { proximal landmark, distal landmark, mass fraction, COM fraction from proximal }
+  { prox: 'nose', dist: 'midShoulder', mass: 0.0694, comFrac: 0.50 },     // head+neck
+  { prox: 'midShoulder', dist: 'midHip', mass: 0.4346, comFrac: 0.4495 }, // trunk
+  { prox: 11, dist: 13, mass: 0.0271, comFrac: 0.5772 },  // L upper arm
+  { prox: 12, dist: 14, mass: 0.0271, comFrac: 0.5772 },  // R upper arm
+  { prox: 13, dist: 15, mass: 0.0223, comFrac: 0.4574 },  // L forearm+hand
+  { prox: 14, dist: 16, mass: 0.0223, comFrac: 0.4574 },  // R forearm+hand
+  { prox: 23, dist: 25, mass: 0.1416, comFrac: 0.4095 },  // L thigh
+  { prox: 24, dist: 26, mass: 0.1416, comFrac: 0.4095 },  // R thigh
+  { prox: 25, dist: 27, mass: 0.0570, comFrac: 0.4459 },  // L shank+foot
+  { prox: 26, dist: 28, mass: 0.0570, comFrac: 0.4459 },  // R shank+foot
+];
+
+function getLandmarkPos(lm, id) {
+  if (id === 'nose') return lm[0];
+  if (id === 'midShoulder') return { x: (lm[11].x + lm[12].x) / 2, y: (lm[11].y + lm[12].y) / 2 };
+  if (id === 'midHip') return { x: (lm[23].x + lm[24].x) / 2, y: (lm[23].y + lm[24].y) / 2 };
+  return lm[id];
+}
+
+function computeBiomechanics(lm) {
+  // Whole-body center of mass
+  let comX = 0, comY = 0;
+  for (const seg of BODY_SEGMENTS) {
+    const p = getLandmarkPos(lm, seg.prox);
+    const d = getLandmarkPos(lm, seg.dist);
+    comX += seg.mass * (p.x + seg.comFrac * (d.x - p.x));
+    comY += seg.mass * (p.y + seg.comFrac * (d.y - p.y));
+  }
+
+  // Base of support (wrists)
+  const wristMid = { x: (lm[15].x + lm[16].x) / 2, y: (lm[15].y + lm[16].y) / 2 };
+  const wristSpread = Math.abs(lm[15].x - lm[16].x);
+
+  // COM offset from wrist midpoint
+  const comOffsetX = comX - wristMid.x;
+  const comOffsetY = comY - wristMid.y;
+
+  // Stability margin: how centered is COM over base
+  const halfBase = wristSpread / 2;
+  const stabilityMargin = halfBase > 0.001 ? Math.max(0, Math.min(1, 1 - Math.abs(comOffsetX) / halfBase)) : 0;
+
+  // Joint angles
+  const shoulderAngle = (angleBetween(lm[23], lm[11], lm[13]) + angleBetween(lm[24], lm[12], lm[14])) / 2;
+  const hipAngle = (angleBetween(lm[11], lm[23], lm[25]) + angleBetween(lm[12], lm[24], lm[26])) / 2;
+  const kneeAngle = (angleBetween(lm[23], lm[25], lm[27]) + angleBetween(lm[24], lm[26], lm[28])) / 2;
+
+  // Body line
+  const bl = analyzeBodyLine(lm);
+
+  // Symmetry
+  const hipTilt = Math.abs(lm[23].y - lm[24].y);
+  const shoulderTilt = Math.abs(lm[11].y - lm[12].y);
+
+  return {
+    comX, comY, comOffsetX, comOffsetY, stabilityMargin,
+    shoulderAngle, hipAngle, kneeAngle,
+    bodyLineDev: bl.hipDev, bananaScore: bl.banana,
+    hipTilt, shoulderTilt,
+  };
+}
+
+// ── BIO ACCUMULATOR (running average over hold) ──
+let holdBioSum = {};
+let holdBioCount = 0;
+
+function resetBioAccum() { holdBioSum = {}; holdBioCount = 0; }
+
+function accumBio(lm) {
+  const bio = computeBiomechanics(lm);
+  for (const k in bio) holdBioSum[k] = (holdBioSum[k] || 0) + bio[k];
+  holdBioCount++;
+}
+
+function finalizeBio() {
+  if (!holdBioCount) return null;
+  const avg = {};
+  for (const k in holdBioSum) avg[k] = holdBioSum[k] / holdBioCount;
+  avg.frameCount = holdBioCount;
+  return avg;
+}
+
+// ── COACHING CUE GENERATOR ──
+function generateCoachingCues(bio, shape, view, duration) {
+  const cues = [];
+
+  // Shoulder angle (180° = fully open overhead)
+  if (bio.shoulderAngle < 160)
+    cues.push({ p: 10, text: `Shoulders closed (${bio.shoulderAngle.toFixed(0)}°). Push the floor away hard, reach tall through your arms.` });
+  else if (bio.shoulderAngle < 170)
+    cues.push({ p: 7, text: `Shoulder angle ${bio.shoulderAngle.toFixed(0)}° — press hands into floor, stretch up to open fully.` });
+
+  // Hip angle (180° = fully extended)
+  if (bio.hipAngle < 160)
+    cues.push({ p: 10, text: `Piked at hips (${bio.hipAngle.toFixed(0)}°). Extend toward ceiling, drive hips over shoulders.` });
+  else if (bio.hipAngle < 170)
+    cues.push({ p: 6, text: `Hip angle ${bio.hipAngle.toFixed(0)}° — lengthen through the hips, push up.` });
+
+  // Banana / pike (body line deviation)
+  if (bio.bananaScore > 0.025)
+    cues.push({ p: 9, text: 'Banana back. Squeeze glutes, tuck ribs, posterior pelvic tilt.' });
+  else if (bio.bananaScore > 0.012)
+    cues.push({ p: 5, text: 'Slight arch in lower back. Engage core, flatten the lumbar curve.' });
+  else if (bio.bananaScore < -0.025)
+    cues.push({ p: 6, text: 'Over-piked. Relax the tuck slightly, find neutral pelvis.' });
+
+  // COM lateral shift
+  if (Math.abs(bio.comOffsetX) > 0.04) {
+    const dir = bio.comOffsetX > 0 ? 'right' : 'left';
+    cues.push({ p: 7, text: `Weight shifted ${dir} of center. Press evenly through both hands.` });
+  }
+
+  // Knees (full shape only)
+  if (shape === 'full' && bio.kneeAngle < 165)
+    cues.push({ p: 4, text: `Soft knees (${bio.kneeAngle.toFixed(0)}°). Squeeze quads, lock out legs.` });
+
+  // Symmetry
+  if (bio.hipTilt > 0.035)
+    cues.push({ p: 5, text: 'Hips uneven — level your pelvis, check if one leg drifts.' });
+  if (bio.shoulderTilt > 0.035)
+    cues.push({ p: 4, text: 'Shoulders uneven — distribute weight evenly between hands.' });
+
+  // Stability
+  if (bio.stabilityMargin < 0.3)
+    cues.push({ p: 8, text: 'COM near edge of base. Shift weight toward center of your hands.' });
+
+  cues.sort((a, b) => b.p - a.p);
+  if (!cues.length) return [{ p: 0, text: 'Alignment looks solid. Focus on hold time and breathing.' }];
+  return cues.slice(0, 3);
+}
+
 // ── CAMERA + POSE ──
 async function startCamera() {
   if (cameraStarted) return;
@@ -555,16 +692,13 @@ async function startCamera() {
         // Debug
         const dbg = document.getElementById('debug-info');
         if (dbg && dbg.style.display !== 'none') {
-          const bl = currentView === 'side' ? analyzeBodyLine(lm) : null;
-          const lk = angleBetween(lm[23], lm[25], lm[27]);
-          const rk = angleBetween(lm[24], lm[26], lm[28]);
-          const spread = Math.abs(lm[11].x - lm[12].x);
+          const bio = computeBiomechanics(lm);
           dbg.innerHTML =
-            `view: ${currentView} (shoulder spread ${spread.toFixed(2)})<br>` +
-            `shape: ${currentShape} (knee avg ${((lk+rk)/2).toFixed(0)}°)<br>` +
-            (bl ? `banana dev: ${bl.banana.toFixed(3)} | hip dev: ${bl.hipDev.toFixed(3)}<br>` : '') +
-            `wristY: ${Math.max(lm[15].y,lm[16].y).toFixed(2)} (>0.6)<br>` +
-            `ankleY: ${Math.min(lm[27].y,lm[28].y).toFixed(2)} (<0.45)<br>`;
+            `${currentView} | ${currentShape} | stability ${(bio.stabilityMargin*100).toFixed(0)}%<br>` +
+            `shoulder ${bio.shoulderAngle.toFixed(0)}° | hip ${bio.hipAngle.toFixed(0)}° | knee ${bio.kneeAngle.toFixed(0)}°<br>` +
+            `COM Δx=${bio.comOffsetX.toFixed(3)} Δy=${bio.comOffsetY.toFixed(3)}<br>` +
+            `banana ${bio.bananaScore.toFixed(3)} | line dev ${bio.bodyLineDev.toFixed(3)}<br>` +
+            `tilt hip=${bio.hipTilt.toFixed(3)} shldr=${bio.shoulderTilt.toFixed(3)}`;
         }
       }
     });
@@ -672,12 +806,14 @@ function updateHoldState(handstand, lm) {
     holdShapeTimes = {};
     lastSampleTime = 0;
     lastShapeChangeTime = Date.now();
+    resetBioAccum();
     dot.classList.add('active');
     status.textContent = 'handstand detected — holding';
     startTimerDisplay();
   } else if (handstand && isHolding) {
-    // Mid-hold: sample frames
+    // Mid-hold: sample frames + biomechanics
     sampleHoldFrame(lm);
+    accumBio(lm);
   } else if (!handstand && isHolding) {
     isHolding = false;
     holdDuration = (Date.now() - holdStart) / 1000;
@@ -695,6 +831,7 @@ function updateHoldState(handstand, lm) {
       const dominant = Object.entries(holdShapeTimes).sort((a,b) => b[1] - a[1])[0];
       lastHoldShape = dominant ? dominant[0] : currentShape;
       lastHoldView = lastHoldFrames[lastHoldShape]?.view || currentView;
+      lastHoldBio = finalizeBio();
 
       if (isRecording) recHolds.push(holdDuration);
       autoSaveHold(holdDuration);
@@ -739,23 +876,22 @@ function updateFeedbackCard() {
     carousel.style.display = 'none';
   }
 
+  // Physics-based coaching cues — immediate, offline, no API key needed
+  if (lastHoldBio) {
+    const cues = generateCoachingCues(lastHoldBio, lastHoldShape, lastHoldView, lastHoldDuration);
+    document.getElementById('fb-text').textContent = cues.map(c => c.text).join('\n\n');
+    document.getElementById('fb-text').style.display = 'block';
+    document.getElementById('feedback-card').classList.add('has-content');
+  } else {
+    document.getElementById('fb-placeholder').textContent = 'hold detected';
+    document.getElementById('fb-placeholder').style.display = 'block';
+  }
+
+  // Claude AI analysis — optional upgrade when online + API key set
   const threshold = parseFloat(getSetting('threshold', '3'));
   const apiKey = getSetting('apiKey', '');
   const analyseBtn = document.getElementById('analyse-btn');
-
-  if (lastHoldDuration >= threshold && apiKey) {
-    analyseBtn.style.display = 'inline-block';
-    document.getElementById('fb-placeholder').textContent = 'tap ANALYSE for coaching cues';
-    document.getElementById('fb-placeholder').style.display = 'block';
-  } else if (!apiKey) {
-    analyseBtn.style.display = 'none';
-    document.getElementById('fb-placeholder').textContent = 'add API key in ⚙ for analysis';
-    document.getElementById('fb-placeholder').style.display = 'block';
-  } else {
-    analyseBtn.style.display = 'none';
-    document.getElementById('fb-placeholder').textContent = `hold ≥ ${threshold}s to unlock analysis`;
-    document.getElementById('fb-placeholder').style.display = 'block';
-  }
+  analyseBtn.style.display = (lastHoldDuration >= threshold && apiKey) ? 'inline-block' : 'none';
 }
 
 // ── CLAUDE ANALYSIS ──
@@ -789,9 +925,15 @@ async function analyseLastHold() {
     ? `Shapes observed: ${shapes.join(', ')}. Dominant shape: ${lastHoldShape}.`
     : `Shape: ${lastHoldShape}.`;
 
-  const prompt = `You are a handstand coach. This is a ${lastHoldDuration.toFixed(1)}s handstand hold. ${shapeSummary} ${viewNote}
+  const bioNote = lastHoldBio ? `
+Biomechanics (averaged over ${lastHoldBio.frameCount} frames):
+Shoulder: ${lastHoldBio.shoulderAngle.toFixed(1)}° (180=open). Hip: ${lastHoldBio.hipAngle.toFixed(1)}° (180=extended). Knee: ${lastHoldBio.kneeAngle.toFixed(1)}°.
+COM offset from base: x=${lastHoldBio.comOffsetX.toFixed(3)}. Banana: ${lastHoldBio.bananaScore.toFixed(3)} (>0=banana, <0=pike).
+Stability: ${(lastHoldBio.stabilityMargin*100).toFixed(0)}%. Hip tilt: ${lastHoldBio.hipTilt.toFixed(3)}. Shoulder tilt: ${lastHoldBio.shoulderTilt.toFixed(3)}.` : '';
 
-Give 2-3 terse, specific coaching cues. Prioritise the most critical alignment issue. Be direct — no filler, no encouragement, just what to fix. Max 60 words.`;
+  const prompt = `You are a handstand coach. This is a ${lastHoldDuration.toFixed(1)}s handstand hold. ${shapeSummary} ${viewNote}${bioNote}
+
+Give 2-3 terse, specific coaching cues grounded in the biomechanics data. Prioritise the most critical alignment issue. Be direct — no filler, no encouragement, just what to fix. Max 60 words.`;
 
   try {
     const res = await fetch('https://api.anthropic.com/v1/messages', {
