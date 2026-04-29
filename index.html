@@ -534,6 +534,11 @@ function getLandmarkPos(lm, id) {
   return lm[id];
 }
 
+// Mass fractions above each joint (for torque computation)
+const MASS_ABOVE_SHOULDER = 0.0694 + 0.4346 + 0.1416*2 + 0.0570*2; // ~0.90
+const MASS_ABOVE_HIP = 0.1416*2 + 0.0570*2;                         // ~0.40
+const MASS_ABOVE_KNEE = 0.0570*2;                                     // ~0.11
+
 function computeBiomechanics(lm) {
   // Whole-body center of mass
   let comX = 0, comY = 0;
@@ -545,12 +550,13 @@ function computeBiomechanics(lm) {
   }
 
   // Base of support (wrists)
-  const wristMid = { x: (lm[15].x + lm[16].x) / 2, y: (lm[15].y + lm[16].y) / 2 };
+  const wristMidX = (lm[15].x + lm[16].x) / 2;
+  const wristMidY = (lm[15].y + lm[16].y) / 2;
   const wristSpread = Math.abs(lm[15].x - lm[16].x);
 
   // COM offset from wrist midpoint
-  const comOffsetX = comX - wristMid.x;
-  const comOffsetY = comY - wristMid.y;
+  const comOffsetX = comX - wristMidX;
+  const comOffsetY = comY - wristMidY;
 
   // Stability margin: how centered is COM over base
   const halfBase = wristSpread / 2;
@@ -560,6 +566,7 @@ function computeBiomechanics(lm) {
   const shoulderAngle = (angleBetween(lm[23], lm[11], lm[13]) + angleBetween(lm[24], lm[12], lm[14])) / 2;
   const hipAngle = (angleBetween(lm[11], lm[23], lm[25]) + angleBetween(lm[12], lm[24], lm[26])) / 2;
   const kneeAngle = (angleBetween(lm[23], lm[25], lm[27]) + angleBetween(lm[24], lm[26], lm[28])) / 2;
+  const elbowAngle = (angleBetween(lm[11], lm[13], lm[15]) + angleBetween(lm[12], lm[14], lm[16])) / 2;
 
   // Body line
   const bl = analyzeBodyLine(lm);
@@ -568,43 +575,102 @@ function computeBiomechanics(lm) {
   const hipTilt = Math.abs(lm[23].y - lm[24].y);
   const shoulderTilt = Math.abs(lm[11].y - lm[12].y);
 
+  // Per-joint horizontal drift from vertical (wrist plumb line)
+  const shoulderDriftX = ((lm[11].x + lm[12].x) / 2) - wristMidX;
+  const hipDriftX = ((lm[23].x + lm[24].x) / 2) - wristMidX;
+  const kneeDriftX = ((lm[25].x + lm[26].x) / 2) - wristMidX;
+
+  // Joint torques — relative torque = mass_above × |horizontal deviation from vertical|
+  // Units are arbitrary but proportional to real torque. Higher = joint working harder.
+  const shoulderTorque = MASS_ABOVE_SHOULDER * Math.abs(shoulderDriftX);
+  const hipTorque = MASS_ABOVE_HIP * Math.abs(hipDriftX);
+  const kneeTorque = MASS_ABOVE_KNEE * Math.abs(kneeDriftX);
+  const peakTorqueJoint = shoulderTorque >= hipTorque && shoulderTorque >= kneeTorque ? 0
+                        : hipTorque >= kneeTorque ? 1 : 2; // 0=shoulder, 1=hip, 2=knee
+
+  // Alignment quality score (0-100, higher = better)
+  let alignmentScore = 100;
+  alignmentScore -= Math.max(0, 180 - shoulderAngle) * 1.5;
+  alignmentScore -= Math.max(0, 180 - hipAngle) * 1.0;
+  alignmentScore -= Math.max(0, 180 - elbowAngle) * 0.5;
+  alignmentScore -= Math.abs(bl.banana) * 300;
+  alignmentScore -= Math.abs(comOffsetX) * 150;
+  alignmentScore -= hipTilt * 80;
+  alignmentScore -= shoulderTilt * 80;
+  alignmentScore = Math.max(0, Math.min(100, Math.round(alignmentScore)));
+
   return {
     comX, comY, comOffsetX, comOffsetY, stabilityMargin,
-    shoulderAngle, hipAngle, kneeAngle,
+    shoulderAngle, hipAngle, kneeAngle, elbowAngle,
     bodyLineDev: bl.hipDev, bananaScore: bl.banana,
     hipTilt, shoulderTilt,
+    shoulderDriftX, hipDriftX, kneeDriftX,
+    shoulderTorque, hipTorque, kneeTorque, peakTorqueJoint,
+    alignmentScore,
   };
 }
 
-// ── BIO ACCUMULATOR (running average + time-series) ──
+// ── BIO ACCUMULATOR (running average + time-series + velocity) ──
 let holdBioSum = {};
 let holdBioCount = 0;
 let holdBioSeries = [];
 let lastBioSampleTime = 0;
+let prevBioComX = null, prevBioComY = null, prevBioTime = null;
+let smoothComVx = 0, smoothComVy = 0;
+const VEL_SMOOTH = 0.15; // EMA smoothing factor for COM velocity
 
 function resetBioAccum() {
   holdBioSum = {};
   holdBioCount = 0;
   holdBioSeries = [];
   lastBioSampleTime = 0;
+  prevBioComX = null; prevBioComY = null; prevBioTime = null;
+  smoothComVx = 0; smoothComVy = 0;
 }
 
 function accumBio(lm) {
   const bio = computeBiomechanics(lm);
+
+  // COM velocity (smoothed EMA)
+  const now = Date.now();
+  if (prevBioComX !== null && prevBioTime !== null) {
+    const dt = (now - prevBioTime) / 1000;
+    if (dt > 0.01 && dt < 1) {
+      const vx = (bio.comX - prevBioComX) / dt;
+      const vy = (bio.comY - prevBioComY) / dt;
+      smoothComVx = smoothComVx * (1 - VEL_SMOOTH) + vx * VEL_SMOOTH;
+      smoothComVy = smoothComVy * (1 - VEL_SMOOTH) + vy * VEL_SMOOTH;
+    }
+  }
+  prevBioComX = bio.comX; prevBioComY = bio.comY; prevBioTime = now;
+
+  bio.comVx = smoothComVx;
+  bio.comVy = smoothComVy;
+  bio.comSpeed = Math.sqrt(smoothComVx**2 + smoothComVy**2);
+
+  // Predictive stability: time until COM exits base of support
+  const halfBase = Math.abs(lm[15].x - lm[16].x) / 2;
+  const distToEdge = Math.max(0, halfBase - Math.abs(bio.comOffsetX));
+  bio.timeToEdge = Math.abs(smoothComVx) > 0.001 ? distToEdge / Math.abs(smoothComVx) : 99;
+
   for (const k in bio) holdBioSum[k] = (holdBioSum[k] || 0) + bio[k];
   holdBioCount++;
 
   // Time-series at ~5fps for training data
-  const now = Date.now();
   if (now - lastBioSampleTime >= 200) {
     lastBioSampleTime = now;
     holdBioSeries.push({
       t: now - holdStart,
       comX: bio.comX, comY: bio.comY,
       comOffsetX: bio.comOffsetX, comOffsetY: bio.comOffsetY,
-      shoulderAngle: bio.shoulderAngle, hipAngle: bio.hipAngle, kneeAngle: bio.kneeAngle,
+      comVx: bio.comVx, comVy: bio.comVy, comSpeed: bio.comSpeed,
+      shoulderAngle: bio.shoulderAngle, hipAngle: bio.hipAngle,
+      kneeAngle: bio.kneeAngle, elbowAngle: bio.elbowAngle,
       bananaScore: bio.bananaScore, stabilityMargin: bio.stabilityMargin,
+      shoulderTorque: bio.shoulderTorque, hipTorque: bio.hipTorque,
+      alignmentScore: bio.alignmentScore,
       hipTilt: bio.hipTilt, shoulderTilt: bio.shoulderTilt,
+      timeToEdge: bio.timeToEdge,
     });
   }
 }
@@ -618,8 +684,16 @@ function finalizeBio() {
 }
 
 // ── COACHING CUE GENERATOR ──
+const JOINT_NAMES = ['shoulder', 'hip', 'knee'];
+
 function generateCoachingCues(bio, shape, view, duration) {
   const cues = [];
+
+  // Elbow angle — arms must be locked
+  if (bio.elbowAngle < 160)
+    cues.push({ p: 11, text: `Bent elbows (${bio.elbowAngle.toFixed(0)}°). Lock out arms — straight elbows are non-negotiable.` });
+  else if (bio.elbowAngle < 172)
+    cues.push({ p: 6, text: `Elbows slightly soft (${bio.elbowAngle.toFixed(0)}°). Push through the heels of your hands, lock arms fully.` });
 
   // Shoulder angle (180° = fully open overhead)
   if (bio.shoulderAngle < 160)
@@ -661,9 +735,27 @@ function generateCoachingCues(bio, shape, view, duration) {
   if (bio.stabilityMargin < 0.3)
     cues.push({ p: 8, text: 'COM near edge of base. Shift weight toward center of your hands.' });
 
+  // Bottleneck joint (torque analysis)
+  if (bio.shoulderTorque > 0.01 || bio.hipTorque > 0.01) {
+    const joint = JOINT_NAMES[bio.peakTorqueJoint];
+    const torqueVal = [bio.shoulderTorque, bio.hipTorque, bio.kneeTorque][bio.peakTorqueJoint];
+    if (torqueVal > 0.02)
+      cues.push({ p: 3, text: `Highest torque at ${joint} — this joint is working hardest. Stack it over the wrists to reduce effort.` });
+  }
+
+  // COM drift warning
+  if (bio.comSpeed > 0.08)
+    cues.push({ p: 6, text: `High COM drift (${(bio.comSpeed*100).toFixed(0)} units/s). Find stillness — micro-adjust with fingers, not big body shifts.` });
+
+  // Alignment score summary
+  const score = bio.alignmentScore;
+  if (score !== undefined) {
+    const grade = score >= 85 ? 'excellent' : score >= 70 ? 'good' : score >= 50 ? 'moderate' : 'needs work';
+    cues.push({ p: 0, text: `Alignment: ${score}/100 (${grade}). ${duration >= 10 && score >= 70 ? 'Good hold — push for 15s+.' : ''}` });
+  }
+
   cues.sort((a, b) => b.p - a.p);
-  if (!cues.length) return [{ p: 0, text: 'Alignment looks solid. Focus on hold time and breathing.' }];
-  return cues.slice(0, 3);
+  return cues.slice(0, 4);
 }
 
 // ── CAMERA + POSE ──
@@ -761,12 +853,13 @@ async function startCamera() {
         const dbg = document.getElementById('debug-info');
         if (dbg && dbg.style.display !== 'none') {
           const bio = computeBiomechanics(lm);
+          const speed = Math.sqrt(smoothComVx**2 + smoothComVy**2);
           dbg.innerHTML =
-            `${currentView} | ${currentShape} | stability ${(bio.stabilityMargin*100).toFixed(0)}%<br>` +
-            `shoulder ${bio.shoulderAngle.toFixed(0)}° | hip ${bio.hipAngle.toFixed(0)}° | knee ${bio.kneeAngle.toFixed(0)}°<br>` +
-            `COM Δx=${bio.comOffsetX.toFixed(3)} Δy=${bio.comOffsetY.toFixed(3)}<br>` +
-            `banana ${bio.bananaScore.toFixed(3)} | line dev ${bio.bodyLineDev.toFixed(3)}<br>` +
-            `tilt hip=${bio.hipTilt.toFixed(3)} shldr=${bio.shoulderTilt.toFixed(3)}`;
+            `${currentView} | ${currentShape} | align ${bio.alignmentScore} | stb ${(bio.stabilityMargin*100).toFixed(0)}%<br>` +
+            `shldr ${bio.shoulderAngle.toFixed(0)}° | hip ${bio.hipAngle.toFixed(0)}° | knee ${bio.kneeAngle.toFixed(0)}° | elbow ${bio.elbowAngle.toFixed(0)}°<br>` +
+            `COM Δx=${bio.comOffsetX.toFixed(3)} vel=${(speed*100).toFixed(1)}/s<br>` +
+            `torque s=${bio.shoulderTorque.toFixed(3)} h=${bio.hipTorque.toFixed(3)} k=${bio.kneeTorque.toFixed(3)} peak=${JOINT_NAMES[bio.peakTorqueJoint]}<br>` +
+            `banana ${bio.bananaScore.toFixed(3)} | tilt h=${bio.hipTilt.toFixed(3)} s=${bio.shoulderTilt.toFixed(3)}`;
         }
       }
     });
@@ -865,13 +958,29 @@ function drawBioOverlay(ctx, lm, w, h) {
   ctx.fillStyle = comColor; ctx.fill();
   ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
 
-  // COM crosshair
-  ctx.strokeStyle = comColor; ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
-  ctx.beginPath(); ctx.moveTo(comScreenX - 12, comScreenY); ctx.lineTo(comScreenX + 12, comScreenY); ctx.stroke();
-  ctx.beginPath(); ctx.moveTo(comScreenX, comScreenY - 12); ctx.lineTo(comScreenX, comScreenY + 12); ctx.stroke();
-  ctx.globalAlpha = 1;
+  // COM velocity arrow
+  const velScale = 500; // amplify for visibility
+  const vxScreen = -smoothComVx * velScale; // flip x for mirrored canvas
+  const vyScreen = smoothComVy * velScale;
+  const velMag = Math.sqrt(vxScreen**2 + vyScreen**2);
+  if (velMag > 3) {
+    ctx.strokeStyle = 'rgba(255,200,100,0.7)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(comScreenX, comScreenY);
+    ctx.lineTo(comScreenX + vxScreen, comScreenY + vyScreen);
+    ctx.stroke();
+    // Arrowhead
+    const angle = Math.atan2(vyScreen, vxScreen);
+    ctx.beginPath();
+    ctx.moveTo(comScreenX + vxScreen, comScreenY + vyScreen);
+    ctx.lineTo(comScreenX + vxScreen - 6*Math.cos(angle-0.4), comScreenY + vyScreen - 6*Math.sin(angle-0.4));
+    ctx.moveTo(comScreenX + vxScreen, comScreenY + vyScreen);
+    ctx.lineTo(comScreenX + vxScreen - 6*Math.cos(angle+0.4), comScreenY + vyScreen - 6*Math.sin(angle+0.4));
+    ctx.stroke();
+  }
 
-  // Stability meter (top-left corner)
+  // Stability meter (left edge)
   const meterW = 4, meterH = 60;
   const meterX = 12, meterY = 40;
   ctx.fillStyle = 'rgba(0,0,0,0.4)';
@@ -882,6 +991,36 @@ function drawBioOverlay(ctx, lm, w, h) {
   ctx.font = '8px monospace';
   ctx.fillStyle = 'rgba(255,255,255,0.5)';
   ctx.fillText('STB', meterX - 1, meterY - 4);
+
+  // Alignment score (top-right corner)
+  const score = bio.alignmentScore;
+  const scoreColor = score >= 85 ? 'rgba(127,255,178,0.9)'
+                   : score >= 70 ? 'rgba(200,184,255,0.9)'
+                   : score >= 50 ? 'rgba(255,210,100,0.9)'
+                   :               'rgba(255,100,100,0.9)';
+  ctx.font = 'bold 20px monospace';
+  ctx.fillStyle = scoreColor;
+  ctx.textAlign = 'right';
+  ctx.fillText(score, w - 14, 56);
+  ctx.font = '8px monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillText('ALIGN', w - 14, 66);
+  ctx.textAlign = 'left';
+
+  // Bottleneck joint indicator
+  const peakTorque = [bio.shoulderTorque, bio.hipTorque, bio.kneeTorque][bio.peakTorqueJoint];
+  if (peakTorque > 0.008) {
+    const jointLm = [[11,12],[23,24],[25,26]][bio.peakTorqueJoint];
+    const jx = (1 - (lm[jointLm[0]].x + lm[jointLm[1]].x) / 2) * w;
+    const jy = ((lm[jointLm[0]].y + lm[jointLm[1]].y) / 2) * h;
+    ctx.beginPath(); ctx.arc(jx, jy, 10, 0, Math.PI * 2);
+    ctx.strokeStyle = 'rgba(255,100,100,0.6)';
+    ctx.lineWidth = 2;
+    ctx.stroke();
+    ctx.font = '7px monospace';
+    ctx.fillStyle = 'rgba(255,100,100,0.8)';
+    ctx.fillText('TORQUE', jx + 14, jy + 3);
+  }
 
   ctx.restore();
 }
@@ -1048,8 +1187,10 @@ async function analyseLastHold() {
 
   const bioNote = lastHoldBio ? `
 Biomechanics (averaged over ${lastHoldBio.frameCount} frames):
-Shoulder: ${lastHoldBio.shoulderAngle.toFixed(1)}° (180=open). Hip: ${lastHoldBio.hipAngle.toFixed(1)}° (180=extended). Knee: ${lastHoldBio.kneeAngle.toFixed(1)}°.
-COM offset from base: x=${lastHoldBio.comOffsetX.toFixed(3)}. Banana: ${lastHoldBio.bananaScore.toFixed(3)} (>0=banana, <0=pike).
+Alignment score: ${lastHoldBio.alignmentScore.toFixed(0)}/100.
+Shoulder: ${lastHoldBio.shoulderAngle.toFixed(1)}°. Hip: ${lastHoldBio.hipAngle.toFixed(1)}°. Knee: ${lastHoldBio.kneeAngle.toFixed(1)}°. Elbow: ${lastHoldBio.elbowAngle.toFixed(1)}° (all 180=ideal).
+COM offset: x=${lastHoldBio.comOffsetX.toFixed(3)}. COM drift speed: ${(lastHoldBio.comSpeed*100).toFixed(1)}/s. Banana: ${lastHoldBio.bananaScore.toFixed(3)} (>0=banana).
+Torques — shoulder: ${lastHoldBio.shoulderTorque.toFixed(3)}, hip: ${lastHoldBio.hipTorque.toFixed(3)} (higher=more effort). Peak: ${JOINT_NAMES[Math.round(lastHoldBio.peakTorqueJoint)]}.
 Stability: ${(lastHoldBio.stabilityMargin*100).toFixed(0)}%. Hip tilt: ${lastHoldBio.hipTilt.toFixed(3)}. Shoulder tilt: ${lastHoldBio.shoulderTilt.toFixed(3)}.` : '';
 
   const prompt = `You are a handstand coach. This is a ${lastHoldDuration.toFixed(1)}s handstand hold. ${shapeSummary} ${viewNote}${bioNote}
@@ -1367,16 +1508,18 @@ function renderBioProgress() {
   const dayAvg = days.map(d => {
     const bios = dayMap[d];
     const avg = {};
-    for (const k of ['shoulderAngle','hipAngle','kneeAngle','bananaScore','stabilityMargin'])
+    for (const k of ['shoulderAngle','hipAngle','kneeAngle','elbowAngle','bananaScore','stabilityMargin','alignmentScore','comSpeed'])
       avg[k] = bios.reduce((s, b) => s + (b[k] || 0), 0) / bios.length;
     return avg;
   });
 
   const metrics = [
-    { key: 'shoulderAngle', label: 'SHOULDER', unit: '°', fmt: v => v.toFixed(0) + '°', good: 'high', ideal: 180, color: '#c8b8ff' },
-    { key: 'hipAngle',      label: 'HIP',      unit: '°', fmt: v => v.toFixed(0) + '°', good: 'high', ideal: 180, color: '#7fffb2' },
-    { key: 'bananaScore',   label: 'BANANA',    unit: '',  fmt: v => v.toFixed(3),       good: 'low',  ideal: 0,   color: '#ff7f9a' },
-    { key: 'stabilityMargin', label: 'STABILITY', unit: '%', fmt: v => (v*100).toFixed(0) + '%', good: 'high', ideal: 1, color: '#ffcc66' },
+    { key: 'alignmentScore', label: 'ALIGNMENT', fmt: v => v.toFixed(0),            good: 'high', color: '#e8e8f0' },
+    { key: 'shoulderAngle',  label: 'SHOULDER',  fmt: v => v.toFixed(0) + '°',      good: 'high', color: '#c8b8ff' },
+    { key: 'hipAngle',       label: 'HIP',       fmt: v => v.toFixed(0) + '°',      good: 'high', color: '#7fffb2' },
+    { key: 'elbowAngle',     label: 'ELBOW',     fmt: v => v.toFixed(0) + '°',      good: 'high', color: '#88ddff' },
+    { key: 'bananaScore',    label: 'BANANA',    fmt: v => v.toFixed(3),             good: 'low',  color: '#ff7f9a' },
+    { key: 'stabilityMargin',label: 'STABILITY', fmt: v => (v*100).toFixed(0) + '%', good: 'high', color: '#ffcc66' },
   ];
 
   function sparklineSVG(values, color, minV, maxV) {
@@ -1438,10 +1581,12 @@ function renderEntries() {
       <div class="session-date"><span>${label}</span><span class="session-best">best ${best}s</span></div>
       ${entries.map(e => {
         const bioTags = e.bio ? `<div class="entry-bio">
+          ${e.bio.alignmentScore !== undefined ? `<span class="entry-bio-tag" style="color:${e.bio.alignmentScore >= 70 ? 'var(--success)' : 'var(--accent)'}">${e.bio.alignmentScore.toFixed(0)}/100</span>` : ''}
           <span class="entry-bio-tag">S ${e.bio.shoulderAngle.toFixed(0)}°</span>
           <span class="entry-bio-tag">H ${e.bio.hipAngle.toFixed(0)}°</span>
+          ${e.bio.elbowAngle !== undefined ? `<span class="entry-bio-tag">E ${e.bio.elbowAngle.toFixed(0)}°</span>` : ''}
           <span class="entry-bio-tag">STB ${(e.bio.stabilityMargin*100).toFixed(0)}%</span>
-          ${Math.abs(e.bio.bananaScore) > 0.01 ? `<span class="entry-bio-tag">${e.bio.bananaScore > 0 ? 'banana' : 'pike'} ${Math.abs(e.bio.bananaScore).toFixed(3)}</span>` : ''}
+          ${Math.abs(e.bio.bananaScore) > 0.01 ? `<span class="entry-bio-tag">${e.bio.bananaScore > 0 ? 'banana' : 'pike'}</span>` : ''}
         </div>` : '';
         return `<div class="entry">
           <div class="entry-time">${e.seconds}s</div>
