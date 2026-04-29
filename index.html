@@ -186,6 +186,21 @@
     .modal-actions { display: flex; gap: 0.75rem; margin-top: 1.25rem; }
     .modal-actions .btn { flex: 1; padding: 0.7rem; }
 
+    /* BIO PROGRESS */
+    .bio-progress-section { margin-bottom: 1.5rem; }
+    .bio-metric-row {
+      display: flex; align-items: center; gap: 0.75rem;
+      padding: 0.5rem 0; border-bottom: 1px solid rgba(42,42,58,0.3);
+    }
+    .bio-metric-label { font-size: 0.55rem; letter-spacing: 0.15em; color: var(--muted); min-width: 60px; }
+    .bio-metric-spark { flex: 1; height: 24px; }
+    .bio-metric-val { font-size: 0.75rem; color: var(--accent); min-width: 42px; text-align: right; font-weight: 700; }
+    .bio-metric-trend { font-size: 0.6rem; min-width: 16px; text-align: center; }
+
+    /* ENTRY BIO BADGES */
+    .entry-bio { display: flex; gap: 0.5rem; margin-top: 0.2rem; flex-wrap: wrap; }
+    .entry-bio-tag { font-size: 0.55rem; letter-spacing: 0.1em; color: var(--muted); background: rgba(200,184,255,0.06); padding: 0.1rem 0.35rem; border-radius: 3px; }
+
     /* TOAST */
     .toast { position: fixed; bottom: 2rem; left: 50%; transform: translateX(-50%) translateY(100px); background: var(--surface); border: 1px solid var(--accent); color: var(--accent); padding: 0.75rem 1.5rem; border-radius: 8px; font-size: 0.75rem; letter-spacing: 0.1em; transition: transform 0.3s ease; z-index: 100; white-space: nowrap; }
     .toast.show { transform: translateX(-50%) translateY(0); }
@@ -272,6 +287,7 @@
     <div class="chart-label">BEST HOLD / DAY — 14 DAYS</div>
     <div class="bar-chart" id="bar-chart"></div>
   </div>
+  <div id="bio-progress"></div>
   <div class="log-section-header">SESSIONS</div>
   <div id="entries"></div>
 </div>
@@ -294,6 +310,13 @@
       <label>ANALYSIS THRESHOLD (seconds)</label>
       <input type="number" id="threshold-input" placeholder="3" min="1" step="0.5">
       <div class="field-hint">Minimum hold duration to enable analysis button.</div>
+    </div>
+    <div class="field">
+      <label>TRAINING DATA</label>
+      <div class="field-hint" id="data-stats"></div>
+      <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
+        <button class="btn" onclick="exportTrainingData()" style="flex:1;padding:0.6rem;font-size:0.7rem;">EXPORT JSON</button>
+      </div>
     </div>
     <div class="modal-actions">
       <button class="btn" onclick="closeSettings()">CANCEL</button>
@@ -347,6 +370,8 @@ function setSetting(key, val) { localStorage.setItem('hs-' + key, val); }
 function openSettings() {
   document.getElementById('api-key-input').value = getSetting('apiKey', '');
   document.getElementById('threshold-input').value = getSetting('threshold', '3');
+  const bioCount = db.filter(e => e.bio).length;
+  document.getElementById('data-stats').textContent = `${db.length} holds total · ${bioCount} with biomechanics data`;
   document.getElementById('settings-modal').classList.add('open');
 }
 function closeSettings() { document.getElementById('settings-modal').classList.remove('open'); }
@@ -362,11 +387,32 @@ let idb = null;
 function openIDB() {
   return new Promise((res, rej) => {
     if (idb) return res(idb);
-    const r = indexedDB.open('handstand-videos', 1);
-    r.onupgradeneeded = e => e.target.result.createObjectStore('videos', { keyPath: 'id' });
+    const r = indexedDB.open('handstand-videos', 2);
+    r.onupgradeneeded = e => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains('videos'))
+        db.createObjectStore('videos', { keyPath: 'id' });
+      if (!db.objectStoreNames.contains('bio-series'))
+        db.createObjectStore('bio-series', { keyPath: 'holdId' });
+    };
     r.onsuccess = e => { idb = e.target.result; res(idb); };
     r.onerror = rej;
   });
+}
+function saveBioSeries(holdId, series) {
+  return openIDB().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('bio-series', 'readwrite');
+    tx.objectStore('bio-series').put({ holdId, series });
+    tx.oncomplete = res; tx.onerror = rej;
+  }));
+}
+function getAllBioSeries() {
+  return openIDB().then(db => new Promise((res, rej) => {
+    const tx = db.transaction('bio-series', 'readonly');
+    const r = tx.objectStore('bio-series').getAll();
+    r.onsuccess = e => res(e.target.result);
+    r.onerror = rej;
+  }));
 }
 function saveVideoDB(rec) {
   return openIDB().then(db => new Promise((res, rej) => {
@@ -530,16 +576,37 @@ function computeBiomechanics(lm) {
   };
 }
 
-// ── BIO ACCUMULATOR (running average over hold) ──
+// ── BIO ACCUMULATOR (running average + time-series) ──
 let holdBioSum = {};
 let holdBioCount = 0;
+let holdBioSeries = [];
+let lastBioSampleTime = 0;
 
-function resetBioAccum() { holdBioSum = {}; holdBioCount = 0; }
+function resetBioAccum() {
+  holdBioSum = {};
+  holdBioCount = 0;
+  holdBioSeries = [];
+  lastBioSampleTime = 0;
+}
 
 function accumBio(lm) {
   const bio = computeBiomechanics(lm);
   for (const k in bio) holdBioSum[k] = (holdBioSum[k] || 0) + bio[k];
   holdBioCount++;
+
+  // Time-series at ~5fps for training data
+  const now = Date.now();
+  if (now - lastBioSampleTime >= 200) {
+    lastBioSampleTime = now;
+    holdBioSeries.push({
+      t: now - holdStart,
+      comX: bio.comX, comY: bio.comY,
+      comOffsetX: bio.comOffsetX, comOffsetY: bio.comOffsetY,
+      shoulderAngle: bio.shoulderAngle, hipAngle: bio.hipAngle, kneeAngle: bio.kneeAngle,
+      bananaScore: bio.bananaScore, stabilityMargin: bio.stabilityMargin,
+      hipTilt: bio.hipTilt, shoulderTilt: bio.shoulderTilt,
+    });
+  }
 }
 
 function finalizeBio() {
@@ -687,6 +754,7 @@ async function startCamera() {
         }
 
         drawSkeleton(ctx, lm, canvas.width, canvas.height, currentView);
+        if (isHolding) drawBioOverlay(ctx, lm, canvas.width, canvas.height);
         updateHoldState(isHandstand(lm), lm);
 
         // Debug
@@ -763,6 +831,59 @@ function drawSkeleton(ctx, lm, w, h, view) {
     ctx.setLineDash([]);
     ctx.restore();
   }
+}
+
+function drawBioOverlay(ctx, lm, w, h) {
+  const bio = computeBiomechanics(lm);
+  ctx.save();
+
+  // Vertical reference line through wrist midpoint
+  const wristX = (1 - (lm[15].x + lm[16].x) / 2) * w;
+  ctx.setLineDash([2, 6]);
+  ctx.strokeStyle = 'rgba(255,255,255,0.12)';
+  ctx.lineWidth = 1;
+  ctx.beginPath(); ctx.moveTo(wristX, 0); ctx.lineTo(wristX, h); ctx.stroke();
+  ctx.setLineDash([]);
+
+  // COM dot — colored by stability
+  const comScreenX = (1 - bio.comX) * w;
+  const comScreenY = bio.comY * h;
+  const sm = bio.stabilityMargin;
+  const comColor = sm > 0.6 ? 'rgba(127,255,178,0.9)'
+                 : sm > 0.3 ? 'rgba(255,210,100,0.9)'
+                 :            'rgba(255,100,100,0.9)';
+
+  // COM trail line from wrists to COM
+  ctx.strokeStyle = comColor;
+  ctx.lineWidth = 1;
+  ctx.globalAlpha = 0.4;
+  ctx.beginPath(); ctx.moveTo(wristX, (lm[15].y + lm[16].y) / 2 * h); ctx.lineTo(comScreenX, comScreenY); ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // COM dot
+  ctx.beginPath(); ctx.arc(comScreenX, comScreenY, 7, 0, Math.PI * 2);
+  ctx.fillStyle = comColor; ctx.fill();
+  ctx.strokeStyle = 'rgba(255,255,255,0.5)'; ctx.lineWidth = 1.5; ctx.stroke();
+
+  // COM crosshair
+  ctx.strokeStyle = comColor; ctx.lineWidth = 1; ctx.globalAlpha = 0.5;
+  ctx.beginPath(); ctx.moveTo(comScreenX - 12, comScreenY); ctx.lineTo(comScreenX + 12, comScreenY); ctx.stroke();
+  ctx.beginPath(); ctx.moveTo(comScreenX, comScreenY - 12); ctx.lineTo(comScreenX, comScreenY + 12); ctx.stroke();
+  ctx.globalAlpha = 1;
+
+  // Stability meter (top-left corner)
+  const meterW = 4, meterH = 60;
+  const meterX = 12, meterY = 40;
+  ctx.fillStyle = 'rgba(0,0,0,0.4)';
+  ctx.fillRect(meterX, meterY, meterW, meterH);
+  const fill = sm * meterH;
+  ctx.fillStyle = comColor;
+  ctx.fillRect(meterX, meterY + meterH - fill, meterW, fill);
+  ctx.font = '8px monospace';
+  ctx.fillStyle = 'rgba(255,255,255,0.5)';
+  ctx.fillText('STB', meterX - 1, meterY - 4);
+
+  ctx.restore();
 }
 
 function scoreFrame(lm) {
@@ -960,6 +1081,8 @@ Give 2-3 terse, specific coaching cues grounded in the biomechanics data. Priori
     document.getElementById('fb-text').textContent = text;
     document.getElementById('fb-text').style.display = 'block';
     analyseBtn.style.display = 'none';
+    // Save AI analysis to most recent hold entry
+    if (db.length > 0 && db[0].auto) { db[0].aiCues = text; persist(); }
 
   } catch(e) {
     document.getElementById('fb-loading').style.display = 'none';
@@ -1039,8 +1162,13 @@ function stopTimerDisplay() {
 }
 function autoSaveHold(seconds) {
   const note = document.getElementById('note').value.trim();
-  saveEntry(seconds, note, true, lastHoldShape, lastHoldView);
+  const cues = lastHoldBio ? generateCoachingCues(lastHoldBio, lastHoldShape, lastHoldView, seconds).map(c => c.text) : null;
+  const holdId = saveEntry(seconds, note, true, lastHoldShape, lastHoldView, lastHoldBio, cues);
   document.getElementById('note').value = '';
+  // Save time-series to IndexedDB
+  if (holdBioSeries.length > 0) {
+    saveBioSeries(holdId, holdBioSeries).catch(() => {});
+  }
 }
 
 // ── ZOOM + FLIP ──
@@ -1140,17 +1268,50 @@ function logManual() {
 }
 
 // ── DATA ──
-function saveEntry(seconds, note, auto, shape, view) {
+function saveEntry(seconds, note, auto, shape, view, bio, cues) {
   const entry = { id: Date.now(), seconds: Math.round(seconds*10)/10, note, auto, shape, view, ts: new Date().toISOString() };
+  if (bio) entry.bio = bio;
+  if (cues) entry.cues = cues;
   db.unshift(entry);
   persist();
   showToast(`saved ${entry.seconds}s`);
+  return entry.id;
 }
 function deleteEntry(id) { db = db.filter(e => e.id !== id); persist(); renderLog(); }
 function persist() { localStorage.setItem('handstand-log', JSON.stringify(db)); }
 
+// ── DATA EXPORT ──
+async function exportTrainingData() {
+  const holds = JSON.parse(localStorage.getItem('handstand-log') || '[]');
+  let seriesData = [];
+  try { seriesData = await getAllBioSeries(); } catch(e) {}
+  const seriesMap = {};
+  seriesData.forEach(s => seriesMap[s.holdId] = s.series);
+
+  const data = {
+    exported: new Date().toISOString(),
+    version: 2,
+    holds: holds.map(h => ({
+      ...h,
+      bioSeries: seriesMap[h.id] || null
+    }))
+  };
+
+  const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `handstand-data-${new Date().toISOString().slice(0,10)}.json`;
+  a.click();
+  URL.revokeObjectURL(url);
+
+  const bioCount = holds.filter(h => h.bio).length;
+  const seriesCount = holds.filter(h => seriesMap[h.id]).length;
+  showToast(`exported ${holds.length} holds (${bioCount} with bio, ${seriesCount} with series)`);
+}
+
 // ── RENDER LOG ──
-function renderLog() { renderStats(); renderChart(); renderEntries(); }
+function renderLog() { renderStats(); renderChart(); renderBioProgress(); renderEntries(); }
 
 function renderStats() {
   if (!db.length) { document.getElementById('stats-bar').innerHTML = ''; return; }
@@ -1190,6 +1351,81 @@ function renderChart() {
   }).join('');
 }
 
+function renderBioProgress() {
+  const el = document.getElementById('bio-progress');
+  const bioHolds = db.filter(e => e.bio);
+  if (bioHolds.length < 2) { el.innerHTML = ''; return; }
+
+  // Group by day, average bio per day
+  const dayMap = {};
+  bioHolds.forEach(h => {
+    const d = h.ts.slice(0, 10);
+    if (!dayMap[d]) dayMap[d] = [];
+    dayMap[d].push(h.bio);
+  });
+  const days = Object.keys(dayMap).sort();
+  const dayAvg = days.map(d => {
+    const bios = dayMap[d];
+    const avg = {};
+    for (const k of ['shoulderAngle','hipAngle','kneeAngle','bananaScore','stabilityMargin'])
+      avg[k] = bios.reduce((s, b) => s + (b[k] || 0), 0) / bios.length;
+    return avg;
+  });
+
+  const metrics = [
+    { key: 'shoulderAngle', label: 'SHOULDER', unit: '°', fmt: v => v.toFixed(0) + '°', good: 'high', ideal: 180, color: '#c8b8ff' },
+    { key: 'hipAngle',      label: 'HIP',      unit: '°', fmt: v => v.toFixed(0) + '°', good: 'high', ideal: 180, color: '#7fffb2' },
+    { key: 'bananaScore',   label: 'BANANA',    unit: '',  fmt: v => v.toFixed(3),       good: 'low',  ideal: 0,   color: '#ff7f9a' },
+    { key: 'stabilityMargin', label: 'STABILITY', unit: '%', fmt: v => (v*100).toFixed(0) + '%', good: 'high', ideal: 1, color: '#ffcc66' },
+  ];
+
+  function sparklineSVG(values, color, minV, maxV) {
+    const w = 120, h = 24, pad = 2;
+    if (maxV === minV) maxV = minV + 1;
+    const pts = values.map((v, i) => {
+      const x = pad + (i / Math.max(values.length - 1, 1)) * (w - 2*pad);
+      const y = pad + (1 - (v - minV) / (maxV - minV)) * (h - 2*pad);
+      return `${x},${y}`;
+    });
+    return `<svg viewBox="0 0 ${w} ${h}" width="100%" height="100%" preserveAspectRatio="none">
+      <polyline points="${pts.join(' ')}" fill="none" stroke="${color}" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round"/>
+      <circle cx="${pts[pts.length-1].split(',')[0]}" cy="${pts[pts.length-1].split(',')[1]}" r="2.5" fill="${color}"/>
+    </svg>`;
+  }
+
+  function trend(values) {
+    if (values.length < 2) return '';
+    const last = values[values.length - 1];
+    const prev = values[values.length - 2];
+    const diff = last - prev;
+    if (Math.abs(diff) < 0.5) return '<span class="bio-metric-trend" style="color:var(--muted)">—</span>';
+    return diff > 0
+      ? '<span class="bio-metric-trend" style="color:var(--success)">↑</span>'
+      : '<span class="bio-metric-trend" style="color:var(--danger)">↓</span>';
+  }
+
+  el.innerHTML = `
+    <div class="bio-progress-section">
+      <div class="chart-label">BIOMECHANICS TREND</div>
+      ${metrics.map(m => {
+        const vals = dayAvg.map(d => d[m.key]);
+        const min = Math.min(...vals);
+        const max = Math.max(...vals);
+        const current = vals[vals.length - 1];
+        // For "good: low" metrics, flip the trend arrow
+        const trendHtml = m.good === 'low'
+          ? trend(vals.map(v => -v))
+          : trend(vals);
+        return `<div class="bio-metric-row">
+          <span class="bio-metric-label">${m.label}</span>
+          <div class="bio-metric-spark">${sparklineSVG(vals, m.color, min, max)}</div>
+          ${trendHtml}
+          <span class="bio-metric-val">${m.fmt(current)}</span>
+        </div>`;
+      }).join('')}
+    </div>`;
+}
+
 function renderEntries() {
   const container = document.getElementById('entries');
   if (!db.length) { container.innerHTML = '<div class="empty-state">no holds yet<br>start tracking</div>'; return; }
@@ -1200,15 +1436,23 @@ function renderEntries() {
     const label = new Date(date).toLocaleDateString('en',{weekday:'short',month:'short',day:'numeric'}).toUpperCase();
     return `<div class="session-group">
       <div class="session-date"><span>${label}</span><span class="session-best">best ${best}s</span></div>
-      ${entries.map(e => `
-        <div class="entry">
+      ${entries.map(e => {
+        const bioTags = e.bio ? `<div class="entry-bio">
+          <span class="entry-bio-tag">S ${e.bio.shoulderAngle.toFixed(0)}°</span>
+          <span class="entry-bio-tag">H ${e.bio.hipAngle.toFixed(0)}°</span>
+          <span class="entry-bio-tag">STB ${(e.bio.stabilityMargin*100).toFixed(0)}%</span>
+          ${Math.abs(e.bio.bananaScore) > 0.01 ? `<span class="entry-bio-tag">${e.bio.bananaScore > 0 ? 'banana' : 'pike'} ${Math.abs(e.bio.bananaScore).toFixed(3)}</span>` : ''}
+        </div>` : '';
+        return `<div class="entry">
           <div class="entry-time">${e.seconds}s</div>
           <div class="entry-detail">
             <div class="entry-label">${e.auto?'AUTO':'MANUAL'}${e.shape?' · '+e.shape:''}${e.view?' · '+e.view:''} · ${new Date(e.ts).toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit'})}</div>
+            ${bioTags}
             ${e.note?`<div class="entry-note">${e.note}</div>`:''}
           </div>
           <button class="entry-delete" onclick="deleteEntry(${e.id})">×</button>
-        </div>`).join('')}
+        </div>`;
+      }).join('')}
     </div>`;
   }).join('');
 }
