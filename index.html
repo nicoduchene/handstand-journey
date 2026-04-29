@@ -133,7 +133,7 @@
     .divider { width: 100%; max-width: 400px; border: none; border-top: 1px solid var(--border); }
 
     /* LOG */
-    .stats-bar { display: grid; grid-template-columns: repeat(3, 1fr); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 1.5rem; }
+    .stats-bar { display: grid; grid-template-columns: repeat(auto-fit, minmax(80px, 1fr)); gap: 1px; background: var(--border); border: 1px solid var(--border); border-radius: 8px; overflow: hidden; margin-bottom: 1.5rem; }
     .stat-cell { background: var(--surface); padding: 0.75rem; text-align: center; }
     .stat-val { font-size: 1.4rem; font-weight: 700; color: var(--accent); }
     .stat-label { font-size: 0.6rem; color: var(--muted); letter-spacing: 0.15em; margin-top: 0.2rem; }
@@ -599,6 +599,18 @@ function computeBiomechanics(lm) {
   alignmentScore -= shoulderTilt * 80;
   alignmentScore = Math.max(0, Math.min(100, Math.round(alignmentScore)));
 
+  // Wall detection indicators
+  const ankleAvgX = (lm[27].x + lm[28].x) / 2;
+  const ankleAtEdge = (ankleAvgX < 0.08 || ankleAvgX > 0.92) ? 1 : 0;
+  const ankleAvgY = (lm[27].y + lm[28].y) / 2;
+
+  // Landmark confidence (average visibility of key joints)
+  const KEY_LM = [11,12,15,16,23,24,27,28];
+  const avgVisibility = KEY_LM.reduce((s, i) => s + (lm[i].visibility || 0), 0) / KEY_LM.length;
+
+  // Feet spread (for detecting both feet on wall vs one foot)
+  const feetSpreadY = Math.abs(lm[27].y - lm[28].y);
+
   return {
     comX, comY, comOffsetX, comOffsetY, stabilityMargin,
     shoulderAngle, hipAngle, kneeAngle, elbowAngle,
@@ -607,17 +619,23 @@ function computeBiomechanics(lm) {
     shoulderDriftX, hipDriftX, kneeDriftX,
     shoulderTorque, hipTorque, kneeTorque, peakTorqueJoint,
     alignmentScore,
+    ankleAtEdge, ankleAvgX, ankleAvgY, avgVisibility, feetSpreadY,
   };
 }
 
-// ── BIO ACCUMULATOR (running average + time-series + velocity) ──
+// ── BIO ACCUMULATOR (running average + time-series + velocity + wall detection) ──
 let holdBioSum = {};
 let holdBioCount = 0;
 let holdBioSeries = [];
 let lastBioSampleTime = 0;
 let prevBioComX = null, prevBioComY = null, prevBioTime = null;
 let smoothComVx = 0, smoothComVy = 0;
-const VEL_SMOOTH = 0.15; // EMA smoothing factor for COM velocity
+const VEL_SMOOTH = 0.15;
+// Ankle movement tracking for wall detection
+let prevAnkleX = null, prevAnkleY = null;
+let ankleMovementSum = 0, ankleMovementCount = 0;
+// Alignment score history for phase analysis
+let holdAlignmentHistory = [];
 
 function resetBioAccum() {
   holdBioSum = {};
@@ -626,6 +644,9 @@ function resetBioAccum() {
   lastBioSampleTime = 0;
   prevBioComX = null; prevBioComY = null; prevBioTime = null;
   smoothComVx = 0; smoothComVy = 0;
+  prevAnkleX = null; prevAnkleY = null;
+  ankleMovementSum = 0; ankleMovementCount = 0;
+  holdAlignmentHistory = [];
 }
 
 function accumBio(lm) {
@@ -653,6 +674,18 @@ function accumBio(lm) {
   const distToEdge = Math.max(0, halfBase - Math.abs(bio.comOffsetX));
   bio.timeToEdge = Math.abs(smoothComVx) > 0.001 ? distToEdge / Math.abs(smoothComVx) : 99;
 
+  // Ankle movement tracking (for wall detection)
+  const ankleX = (lm[27].x + lm[28].x) / 2;
+  const ankleY = (lm[27].y + lm[28].y) / 2;
+  if (prevAnkleX !== null) {
+    ankleMovementSum += Math.sqrt((ankleX - prevAnkleX)**2 + (ankleY - prevAnkleY)**2);
+    ankleMovementCount++;
+  }
+  prevAnkleX = ankleX; prevAnkleY = ankleY;
+
+  // Alignment history (for phase analysis)
+  holdAlignmentHistory.push(bio.alignmentScore);
+
   for (const k in bio) holdBioSum[k] = (holdBioSum[k] || 0) + bio[k];
   holdBioCount++;
 
@@ -669,6 +702,7 @@ function accumBio(lm) {
       bananaScore: bio.bananaScore, stabilityMargin: bio.stabilityMargin,
       shoulderTorque: bio.shoulderTorque, hipTorque: bio.hipTorque,
       alignmentScore: bio.alignmentScore,
+      ankleAtEdge: bio.ankleAtEdge, avgVisibility: bio.avgVisibility,
       hipTilt: bio.hipTilt, shoulderTilt: bio.shoulderTilt,
       timeToEdge: bio.timeToEdge,
     });
@@ -680,7 +714,70 @@ function finalizeBio() {
   const avg = {};
   for (const k in holdBioSum) avg[k] = holdBioSum[k] / holdBioCount;
   avg.frameCount = holdBioCount;
+  // Ankle movement (not in bio state, tracked separately)
+  avg.avgAnkleMovement = ankleMovementCount > 0 ? ankleMovementSum / ankleMovementCount : 0;
+  // Hold type classification
+  avg.holdType = classifyHoldType(avg);
+  // Phase analysis
+  avg.phases = analyzeHoldPhases(holdAlignmentHistory);
   return avg;
+}
+
+// ── HOLD TYPE CLASSIFICATION ──
+function classifyHoldType(bio) {
+  // Wall indicators:
+  // 1. Ankles consistently near frame edge (wall is at the edge of camera view)
+  // 2. Very low ankle movement (feet planted on wall don't micro-adjust)
+  // 3. Low landmark visibility could indicate spotter occlusion
+
+  const edgeRatio = bio.ankleAtEdge || 0;  // fraction of frames with ankle at edge
+  const movement = bio.avgAnkleMovement || 999;
+  const vis = bio.avgVisibility || 1;
+
+  // Strong wall signal: high edge ratio + low movement
+  if (edgeRatio > 0.4 && movement < 0.004) return 'wall';
+  // Moderate wall signal: very still feet even if not at edge (wall nearby but not at frame edge)
+  if (movement < 0.0015 && edgeRatio > 0.15) return 'wall';
+  // Possible spotter: landmark visibility drops significantly
+  if (vis < 0.45) return 'spotted';
+  // Uncertain: moderate indicators
+  if (edgeRatio > 0.25 && movement < 0.005) return 'wall-likely';
+
+  return 'freestanding';
+}
+
+// ── HOLD PHASE ANALYSIS ──
+function analyzeHoldPhases(alignHistory) {
+  if (alignHistory.length < 9) return null; // need enough frames for 3 phases
+  const third = Math.floor(alignHistory.length / 3);
+  const entry  = alignHistory.slice(0, third);
+  const steady = alignHistory.slice(third, 2 * third);
+  const exit   = alignHistory.slice(2 * third);
+
+  const avg = arr => arr.reduce((s, v) => s + v, 0) / arr.length;
+  const entryScore  = avg(entry);
+  const steadyScore = avg(steady);
+  const exitScore   = avg(exit);
+
+  // Stability: standard deviation of alignment during steady phase
+  const steadyMean = steadyScore;
+  const steadyStd = Math.sqrt(avg(steady.map(v => (v - steadyMean)**2)));
+
+  // Fatigue: how much alignment drops from steady to exit
+  const fatigue = steadyScore - exitScore; // positive = degrading
+
+  // Entry quality: how quickly alignment stabilizes
+  const entryImprovement = steadyScore - entryScore; // positive = improved after entry
+
+  return {
+    entryScore: Math.round(entryScore),
+    steadyScore: Math.round(steadyScore),
+    exitScore: Math.round(exitScore),
+    steadyStability: Math.round(steadyStd * 10) / 10,
+    fatigue: Math.round(fatigue * 10) / 10,
+    entryImprovement: Math.round(entryImprovement * 10) / 10,
+    pattern: fatigue > 5 ? 'degrading' : fatigue < -3 ? 'improving' : 'stable',
+  };
 }
 
 // ── COACHING CUE GENERATOR ──
@@ -746,6 +843,24 @@ function generateCoachingCues(bio, shape, view, duration) {
   // COM drift warning
   if (bio.comSpeed > 0.08)
     cues.push({ p: 6, text: `High COM drift (${(bio.comSpeed*100).toFixed(0)} units/s). Find stillness — micro-adjust with fingers, not big body shifts.` });
+
+  // Wall hold detection
+  if (bio.holdType === 'wall' || bio.holdType === 'wall-likely') {
+    cues.push({ p: 11, text: `Wall-assisted hold detected. Practice brief freestanding moments by pulling feet off the wall.` });
+  }
+  if (bio.holdType === 'spotted') {
+    cues.push({ p: 2, text: `Possible spotter detected (low landmark visibility). Data may be less reliable.` });
+  }
+
+  // Phase-based cues
+  if (bio.phases) {
+    if (bio.phases.fatigue > 8)
+      cues.push({ p: 5, text: `Alignment dropped ${bio.phases.fatigue.toFixed(0)} pts in final third — fatigue or balance loss. Bail earlier or build endurance.` });
+    if (bio.phases.entryImprovement > 10)
+      cues.push({ p: 2, text: `Entry was rough (${bio.phases.entryScore}) but you stabilized to ${bio.phases.steadyScore}. Work on cleaner kick-ups.` });
+    if (bio.phases.steadyStability > 8)
+      cues.push({ p: 4, text: `High variance during hold (±${bio.phases.steadyStability.toFixed(0)}). Focus on finding stillness.` });
+  }
 
   // Alignment score summary
   const score = bio.alignmentScore;
@@ -854,12 +969,13 @@ async function startCamera() {
         if (dbg && dbg.style.display !== 'none') {
           const bio = computeBiomechanics(lm);
           const speed = Math.sqrt(smoothComVx**2 + smoothComVy**2);
+          const ankleMove = ankleMovementCount > 0 ? (ankleMovementSum / ankleMovementCount) : 0;
           dbg.innerHTML =
             `${currentView} | ${currentShape} | align ${bio.alignmentScore} | stb ${(bio.stabilityMargin*100).toFixed(0)}%<br>` +
             `shldr ${bio.shoulderAngle.toFixed(0)}° | hip ${bio.hipAngle.toFixed(0)}° | knee ${bio.kneeAngle.toFixed(0)}° | elbow ${bio.elbowAngle.toFixed(0)}°<br>` +
             `COM Δx=${bio.comOffsetX.toFixed(3)} vel=${(speed*100).toFixed(1)}/s<br>` +
-            `torque s=${bio.shoulderTorque.toFixed(3)} h=${bio.hipTorque.toFixed(3)} k=${bio.kneeTorque.toFixed(3)} peak=${JOINT_NAMES[bio.peakTorqueJoint]}<br>` +
-            `banana ${bio.bananaScore.toFixed(3)} | tilt h=${bio.hipTilt.toFixed(3)} s=${bio.shoulderTilt.toFixed(3)}`;
+            `torque s=${bio.shoulderTorque.toFixed(3)} h=${bio.hipTorque.toFixed(3)} peak=${JOINT_NAMES[bio.peakTorqueJoint]}<br>` +
+            `ankle edge=${bio.ankleAtEdge} move=${ankleMove.toFixed(4)} vis=${bio.avgVisibility.toFixed(2)}`;
         }
       }
     });
@@ -1106,7 +1222,9 @@ function updateFeedbackCard() {
   document.getElementById('fb-loading').style.display = 'none';
 
   document.getElementById('fb-shape').textContent = lastHoldShape || '';
-  document.getElementById('fb-view').textContent = lastHoldView || '';
+  const holdType = lastHoldBio?.holdType || '';
+  const viewLabel = holdType && holdType !== 'freestanding' ? `${lastHoldView} · ${holdType}` : (lastHoldView || '');
+  document.getElementById('fb-view').textContent = viewLabel;
 
   const shapes = Object.keys(lastHoldFrames);
   const carousel = document.getElementById('frame-carousel');
@@ -1304,7 +1422,8 @@ function stopTimerDisplay() {
 function autoSaveHold(seconds) {
   const note = document.getElementById('note').value.trim();
   const cues = lastHoldBio ? generateCoachingCues(lastHoldBio, lastHoldShape, lastHoldView, seconds).map(c => c.text) : null;
-  const holdId = saveEntry(seconds, note, true, lastHoldShape, lastHoldView, lastHoldBio, cues);
+  const holdType = lastHoldBio ? lastHoldBio.holdType : 'unknown';
+  const holdId = saveEntry(seconds, note, true, lastHoldShape, lastHoldView, lastHoldBio, cues, holdType);
   document.getElementById('note').value = '';
   // Save time-series to IndexedDB
   if (holdBioSeries.length > 0) {
@@ -1409,13 +1528,15 @@ function logManual() {
 }
 
 // ── DATA ──
-function saveEntry(seconds, note, auto, shape, view, bio, cues) {
+function saveEntry(seconds, note, auto, shape, view, bio, cues, holdType) {
   const entry = { id: Date.now(), seconds: Math.round(seconds*10)/10, note, auto, shape, view, ts: new Date().toISOString() };
   if (bio) entry.bio = bio;
   if (cues) entry.cues = cues;
+  if (holdType) entry.holdType = holdType;
   db.unshift(entry);
   persist();
-  showToast(`saved ${entry.seconds}s`);
+  const typeLabel = holdType && holdType !== 'freestanding' ? ` (${holdType})` : '';
+  showToast(`saved ${entry.seconds}s${typeLabel}`);
   return entry.id;
 }
 function deleteEntry(id) { db = db.filter(e => e.id !== id); persist(); renderLog(); }
@@ -1456,11 +1577,15 @@ function renderLog() { renderStats(); renderChart(); renderBioProgress(); render
 
 function renderStats() {
   if (!db.length) { document.getElementById('stats-bar').innerHTML = ''; return; }
-  const best = Math.max(...db.map(e => e.seconds));
+  const freeHolds = db.filter(e => !e.holdType || e.holdType === 'freestanding');
+  const best = freeHolds.length ? Math.max(...freeHolds.map(e => e.seconds)) : Math.max(...db.map(e => e.seconds));
   const streak = calcStreak();
   const days = new Set(db.map(e => e.ts.slice(0,10))).size;
+  const wallBest = db.filter(e => e.holdType === 'wall' || e.holdType === 'wall-likely');
+  const wallLabel = wallBest.length ? `<div class="stat-cell"><div class="stat-val">${Math.max(...wallBest.map(e => e.seconds))}s</div><div class="stat-label">WALL BEST</div></div>` : '';
   document.getElementById('stats-bar').innerHTML = `
-    <div class="stat-cell"><div class="stat-val">${best}s</div><div class="stat-label">BEST</div></div>
+    <div class="stat-cell"><div class="stat-val">${best}s</div><div class="stat-label">${freeHolds.length < db.length ? 'FREE BEST' : 'BEST'}</div></div>
+    ${wallLabel}
     <div class="stat-cell"><div class="stat-val">${streak}</div><div class="stat-label">STREAK</div></div>
     <div class="stat-cell"><div class="stat-val">${days}</div><div class="stat-label">DAYS</div></div>`;
 }
@@ -1591,7 +1716,7 @@ function renderEntries() {
         return `<div class="entry">
           <div class="entry-time">${e.seconds}s</div>
           <div class="entry-detail">
-            <div class="entry-label">${e.auto?'AUTO':'MANUAL'}${e.shape?' · '+e.shape:''}${e.view?' · '+e.view:''} · ${new Date(e.ts).toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit'})}</div>
+            <div class="entry-label">${e.auto?'AUTO':'MANUAL'}${e.holdType && e.holdType !== 'freestanding' ? ' · '+e.holdType : ''}${e.shape?' · '+e.shape:''}${e.view?' · '+e.view:''} · ${new Date(e.ts).toLocaleTimeString('en',{hour:'2-digit',minute:'2-digit'})}</div>
             ${bioTags}
             ${e.note?`<div class="entry-note">${e.note}</div>`:''}
           </div>
