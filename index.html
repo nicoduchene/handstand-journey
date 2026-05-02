@@ -125,6 +125,26 @@
     .btn:disabled { opacity: 0.4; cursor: default; }
     .btn-row { display: flex; gap: 0.75rem; flex-wrap: wrap; justify-content: center; }
 
+    /* FIX 1 — hero CTA layout when camera is inactive */
+    #camera-view.camera-inactive .video-container,
+    #camera-view.camera-inactive .zoom-row,
+    #camera-view.camera-inactive .timer-display,
+    #camera-view.camera-inactive .status-row,
+    #camera-view.camera-inactive #rec-status,
+    #camera-view.camera-inactive #debug-info,
+    #camera-view.camera-inactive .feedback-card,
+    #camera-view.camera-inactive .divider,
+    #camera-view.camera-inactive .manual-row,
+    #camera-view.camera-inactive .note-input { display: none; }
+
+    #camera-view.camera-inactive {
+      min-height: 70vh;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+    }
+
     .manual-row { display: flex; gap: 0.5rem; align-items: center; width: 100%; max-width: 400px; }
     .manual-row input, .note-input { padding: 0.8rem; background: var(--surface); border: 1px solid var(--border); border-radius: 8px; color: var(--text); font-family: inherit; font-size: 0.85rem; }
     .manual-row input { flex: 1; }
@@ -216,7 +236,7 @@
 </nav>
 
 <!-- TRACK -->
-<div id="camera-view" class="view active">
+<div id="camera-view" class="view active camera-inactive">
   <div class="video-container" id="video-container">
     <video id="video" autoplay playsinline muted></video>
     <canvas id="canvas"></canvas>
@@ -229,6 +249,7 @@
     <input type="range" class="zoom-slider" id="zoom-slider" min="0.5" max="3" step="0.1" value="1" oninput="applyZoom(this.value)">
     <span class="zoom-val" id="zoom-val">1×</span>
     <button class="btn" id="flip-btn" onclick="flipCamera()" style="padding:0.4rem 0.75rem;font-size:0.75rem;">⇄</button>
+    <button class="btn" id="mirror-btn" onclick="toggleMirror()" style="padding:0.4rem 0.75rem;font-size:0.75rem;">MIR</button>
   </div>
 
   <div class="timer-display" id="timer">0.0</div>
@@ -362,6 +383,9 @@ let cameraTrack = null;
 let facingMode = 'user';
 let zoomLevel = 1.0;
 let hwZoomMin = 1, hwZoomMax = 1, hwZoomSupported = false;
+
+// Mirror — default false (non-mirrored = coach/natural view)
+let mirrorEnabled = localStorage.getItem('mirrorPref') === 'true';
 
 // ── SETTINGS ──
 function getSetting(key, def) { return localStorage.getItem('hs-' + key) || def; }
@@ -913,6 +937,8 @@ async function startCamera() {
     }
 
     cameraStarted = true;
+    document.getElementById('camera-view').classList.remove('camera-inactive');
+    applyMirror();
     camBtn.style.display = 'none';
     document.getElementById('rec-btn').style.display = 'inline-block';
     document.getElementById('debug-btn').style.display = 'inline-block';
@@ -1435,11 +1461,43 @@ function autoSaveHold(seconds) {
 async function applyZoom(val) {
   zoomLevel = parseFloat(val);
   document.getElementById('zoom-val').textContent = zoomLevel.toFixed(1) + '×';
+
+  if (zoomLevel < 1.0 && hwZoomSupported) {
+    // Try to switch to ultrawide camera for sub-1× on hardware-zoom capable devices
+    try {
+      const devices = await navigator.mediaDevices.enumerateDevices();
+      const videoDevices = devices.filter(d => d.kind === 'videoinput');
+      const ultrawide = videoDevices.find(d =>
+        /ultra|wide|0\.5/i.test(d.label) && d.deviceId !== (cameraTrack?.getSettings()?.deviceId)
+      );
+      if (ultrawide) {
+        const newStream = await navigator.mediaDevices.getUserMedia({
+          video: { deviceId: { exact: ultrawide.deviceId } }
+        });
+        if (cameraTrack) cameraTrack.stop();
+        cameraTrack = newStream.getVideoTracks()[0];
+        videoEl.srcObject = newStream;
+        hwZoomSupported = false; // new device capabilities unknown until re-checked
+        document.getElementById('zoom-val').textContent = zoomLevel.toFixed(1) + '× UW';
+        return;
+      }
+    } catch(e) { /* fall through to CSS scale */ }
+
+    // CSS scale fallback — only when hw zoom was supported but no ultrawide found;
+    // when hwZoomSupported is false the canvas drawImage branch already handles sub-1×
+    document.querySelector('.video-container').style.transform = `scale(${zoomLevel})`;
+    document.getElementById('zoom-val').textContent = zoomLevel.toFixed(1) + '× ↓';
+    return;
+  }
+
+  // Reset CSS scale applied by fallback above
+  document.querySelector('.video-container').style.transform = '';
+
   if (hwZoomSupported && cameraTrack) {
     try { await cameraTrack.applyConstraints({ advanced: [{ zoom: zoomLevel }] }); }
-    catch(e) { /* fall through to digital zoom */ }
+    catch(e) { /* fall through to canvas digital zoom */ }
   }
-  // digital zoom is applied in drawImage each frame
+  // digital zoom > 1× is applied in drawImage each frame when !hwZoomSupported
 }
 
 async function flipCamera() {
@@ -1471,12 +1529,27 @@ async function flipCamera() {
     }
     document.getElementById('zoom-val').textContent = zoomLevel.toFixed(1) + '×';
 
-    // Mirror only for front camera
-    document.getElementById('canvas').style.transform = facingMode === 'user' ? 'scaleX(-1)' : 'scaleX(1)';
+    // Reapply user mirror preference after camera switch
+    applyMirror();
   } catch(e) {
     showToast('could not switch camera');
     facingMode = facingMode === 'user' ? 'environment' : 'user'; // revert
   }
+}
+
+// ── MIRROR ──
+function toggleMirror() {
+  mirrorEnabled = !mirrorEnabled;
+  localStorage.setItem('mirrorPref', mirrorEnabled);
+  applyMirror();
+  document.getElementById('mirror-btn').style.color = mirrorEnabled ? 'var(--accent)' : '';
+}
+function applyMirror() {
+  // Canvas pixels are already drawn mirrored (ctx.scale(-1,1) in pose.onResults).
+  // scaleX(-1) cancels that flip for a natural/coach view (mirrorEnabled=false default).
+  // scaleX(1)  passes through the mirrored pixels for a selfie/mirror view (mirrorEnabled=true).
+  const canvas = document.getElementById('canvas');
+  canvas.style.transform = mirrorEnabled ? 'scaleX(1)' : 'scaleX(-1)';
 }
 
 // ── RECORDING ──
@@ -1782,6 +1855,9 @@ function toggleDebug() {
 }
 
 renderLog();
+applyMirror();
+// Sync MIR button color to persisted preference on load
+if (mirrorEnabled) document.getElementById('mirror-btn').style.color = 'var(--accent)';
 </script>
 <script>if('serviceWorker' in navigator) navigator.serviceWorker.register('sw.js');</script>
 </body>
