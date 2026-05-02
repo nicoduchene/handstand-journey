@@ -334,6 +334,15 @@
       <div class="field-hint">Minimum hold duration to enable analysis button.</div>
     </div>
     <div class="field">
+      <label>BODY CALIBRATION</label>
+      <div class="field-hint" id="body-cal-status"></div>
+      <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
+        <input type="file" id="betas-file-input" accept=".json" style="display:none" onchange="loadBodyScan(event)">
+        <button class="btn" onclick="document.getElementById('betas-file-input').click()" style="flex:1;padding:0.6rem;font-size:0.7rem;">LOAD betas.json</button>
+        <button class="btn" onclick="clearBodyScan()" style="padding:0.6rem;font-size:0.7rem;">CLEAR</button>
+      </div>
+    </div>
+    <div class="field">
       <label>TRAINING DATA</label>
       <div class="field-hint" id="data-stats"></div>
       <div style="display:flex;gap:0.5rem;margin-top:0.5rem;">
@@ -418,7 +427,39 @@ function openSettings() {
   document.getElementById('threshold-input').value = getSetting('threshold', '3');
   const bioCount = db.filter(e => e.bio).length;
   document.getElementById('data-stats').textContent = `${db.length} holds total · ${bioCount} with biomechanics data`;
+  const stored = localStorage.getItem('personalizedMasses');
+  document.getElementById('body-cal-status').textContent = stored
+    ? 'Personalized masses active — COM uses your body shape.'
+    : 'Using de Leva 1996 population averages.';
   document.getElementById('settings-modal').classList.add('open');
+}
+
+function loadBodyScan(event) {
+  const file = event.target.files[0];
+  if (!file) return;
+  const reader = new FileReader();
+  reader.onload = (e) => {
+    try {
+      const data = JSON.parse(e.target.result);
+      if (!data.segmentMasses || typeof data.segmentMasses !== 'object')
+        throw new Error('missing segmentMasses');
+      localStorage.setItem('personalizedMasses', JSON.stringify(data.segmentMasses));
+      const method = data.method || 'unknown';
+      const b = (data.betas || []).slice(0, 3).map(v => v.toFixed(2)).join(', ');
+      document.getElementById('body-cal-status').textContent =
+        `Personalized masses active (${method}). betas: [${b}…]`;
+      showToast('body scan loaded');
+    } catch (err) {
+      showToast('invalid betas.json — ' + err.message);
+    }
+  };
+  reader.readAsText(file);
+}
+
+function clearBodyScan() {
+  localStorage.removeItem('personalizedMasses');
+  document.getElementById('body-cal-status').textContent = 'Using de Leva 1996 population averages.';
+  showToast('body calibration cleared');
 }
 function closeSettings() { document.getElementById('settings-modal').classList.remove('open'); }
 function saveSettings() {
@@ -558,20 +599,33 @@ function analyzeBodyLine(lm) {
 }
 
 // ── BIOMECHANICS ENGINE ──
-// Body segment mass fractions and COM positions (de Leva 1996, male)
+// de Leva 1996 population-average segments — used when no body scan is loaded.
+// Keys match body-scan/scan.py output so personalized masses drop in cleanly.
 const BODY_SEGMENTS = [
-  // { proximal landmark, distal landmark, mass fraction, COM fraction from proximal }
-  { prox: 'nose', dist: 'midShoulder', mass: 0.0694, comFrac: 0.50 },     // head+neck
-  { prox: 'midShoulder', dist: 'midHip', mass: 0.4346, comFrac: 0.4495 }, // trunk
-  { prox: 11, dist: 13, mass: 0.0271, comFrac: 0.5772 },  // L upper arm
-  { prox: 12, dist: 14, mass: 0.0271, comFrac: 0.5772 },  // R upper arm
-  { prox: 13, dist: 15, mass: 0.0223, comFrac: 0.4574 },  // L forearm+hand
-  { prox: 14, dist: 16, mass: 0.0223, comFrac: 0.4574 },  // R forearm+hand
-  { prox: 23, dist: 25, mass: 0.1416, comFrac: 0.4095 },  // L thigh
-  { prox: 24, dist: 26, mass: 0.1416, comFrac: 0.4095 },  // R thigh
-  { prox: 25, dist: 27, mass: 0.0570, comFrac: 0.4459 },  // L shank+foot
-  { prox: 26, dist: 28, mass: 0.0570, comFrac: 0.4459 },  // R shank+foot
+  { prox: 'nose', dist: 'midShoulder', mass: 0.0694, comFrac: 0.50,   key: 'head' },
+  { prox: 'midShoulder', dist: 'midHip', mass: 0.4346, comFrac: 0.4495, key: 'trunk' },
+  { prox: 11, dist: 13, mass: 0.0271, comFrac: 0.5772, key: 'upperArmL' },
+  { prox: 12, dist: 14, mass: 0.0271, comFrac: 0.5772, key: 'upperArmR' },
+  { prox: 13, dist: 15, mass: 0.0223, comFrac: 0.4574, key: 'forearmL' },
+  { prox: 14, dist: 16, mass: 0.0223, comFrac: 0.4574, key: 'forearmR' },
+  { prox: 23, dist: 25, mass: 0.1416, comFrac: 0.4095, key: 'thighL' },
+  { prox: 24, dist: 26, mass: 0.1416, comFrac: 0.4095, key: 'thighR' },
+  { prox: 25, dist: 27, mass: 0.0570, comFrac: 0.4459, key: 'shankL' },
+  { prox: 26, dist: 28, mass: 0.0570, comFrac: 0.4459, key: 'shankR' },
 ];
+
+// Return BODY_SEGMENTS with personalized masses overriding defaults when loaded.
+function getBodySegments() {
+  try {
+    const raw = localStorage.getItem('personalizedMasses');
+    if (!raw) return BODY_SEGMENTS;
+    const masses = JSON.parse(raw);
+    return BODY_SEGMENTS.map(seg => {
+      const m = masses[seg.key];
+      return (m != null) ? { ...seg, mass: m } : seg;
+    });
+  } catch { return BODY_SEGMENTS; }
+}
 
 function getLandmarkPos(lm, id) {
   if (id === 'nose') return lm[0];
@@ -580,15 +634,20 @@ function getLandmarkPos(lm, id) {
   return lm[id];
 }
 
-// Mass fractions above each joint (for torque computation)
-const MASS_ABOVE_SHOULDER = 0.0694 + 0.4346 + 0.1416*2 + 0.0570*2; // ~0.90
-const MASS_ABOVE_HIP = 0.1416*2 + 0.0570*2;                         // ~0.40
-const MASS_ABOVE_KNEE = 0.0570*2;                                     // ~0.11
+function getMassAbove(segs) {
+  const m = k => segs.find(s => s.key === k)?.mass ?? 0;
+  return {
+    shoulder: m('head') + m('trunk') + m('thighL') + m('thighR') + m('shankL') + m('shankR'),
+    hip:      m('thighL') + m('thighR') + m('shankL') + m('shankR'),
+    knee:     m('shankL') + m('shankR'),
+  };
+}
 
 function computeBiomechanics(lm) {
+  const segs = getBodySegments();
   // Whole-body center of mass
   let comX = 0, comY = 0;
-  for (const seg of BODY_SEGMENTS) {
+  for (const seg of segs) {
     const p = getLandmarkPos(lm, seg.prox);
     const d = getLandmarkPos(lm, seg.dist);
     comX += seg.mass * (p.x + seg.comFrac * (d.x - p.x));
@@ -627,10 +686,10 @@ function computeBiomechanics(lm) {
   const kneeDriftX = ((lm[25].x + lm[26].x) / 2) - wristMidX;
 
   // Joint torques — relative torque = mass_above × |horizontal deviation from vertical|
-  // Units are arbitrary but proportional to real torque. Higher = joint working harder.
-  const shoulderTorque = MASS_ABOVE_SHOULDER * Math.abs(shoulderDriftX);
-  const hipTorque = MASS_ABOVE_HIP * Math.abs(hipDriftX);
-  const kneeTorque = MASS_ABOVE_KNEE * Math.abs(kneeDriftX);
+  const { shoulder: mShoulder, hip: mHip, knee: mKnee } = getMassAbove(segs);
+  const shoulderTorque = mShoulder * Math.abs(shoulderDriftX);
+  const hipTorque      = mHip      * Math.abs(hipDriftX);
+  const kneeTorque     = mKnee     * Math.abs(kneeDriftX);
   const peakTorqueJoint = shoulderTorque >= hipTorque && shoulderTorque >= kneeTorque ? 0
                         : hipTorque >= kneeTorque ? 1 : 2; // 0=shoulder, 1=hip, 2=knee
 
