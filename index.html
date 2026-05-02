@@ -250,6 +250,7 @@
     <span class="zoom-val" id="zoom-val">1×</span>
     <button class="btn" id="flip-btn" onclick="flipCamera()" style="padding:0.4rem 0.75rem;font-size:0.75rem;">⇄</button>
     <button class="btn" id="mirror-btn" onclick="toggleMirror()" style="padding:0.4rem 0.75rem;font-size:0.75rem;">MIR</button>
+    <button class="btn" id="cal-btn" onclick="calibrateUser()" style="padding:0.4rem 0.75rem;font-size:0.75rem;display:none;" title="Calibrate to track only you when multiple people are on screen">CAL</button>
   </div>
 
   <div class="timer-display" id="timer">0.0</div>
@@ -350,6 +351,7 @@
 
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js" crossorigin="anonymous"></script>
 <script src="https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js" crossorigin="anonymous"></script>
+<script src="https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js" crossorigin="anonymous"></script>
 
 <script>
 // ── STATE ──
@@ -386,6 +388,26 @@ let hwZoomMin = 1, hwZoomMax = 1, hwZoomSupported = false;
 
 // Mirror — default false (non-mirrored = coach/natural view)
 let mirrorEnabled = localStorage.getItem('mirrorPref') === 'true';
+
+// ── PERSON TRACKING (ONNX) ──
+let yoloSession = null, reidSession = null;
+let trackedBbox = null;            // current person's bbox [x1,y1,x2,y2] normalized 0-1
+let calibrationEmbedding = null;   // saved OSNet embedding from calibration
+let byteTracker = null;
+let yoloFrameCounter = 0;          // run YOLO every N frames
+let yoloInferenceCount = 0;        // for periodic session recreation (iOS WebGPU stability)
+let reidInferenceCount = 0;
+const YOLO_DETECT_INTERVAL = 4;    // YOLO every 4 frames; Kalman fills in between
+const ONNX_SESSION_RECREATE_AT = 400;
+let onnxBusy = false;              // prevent re-entrant inference
+let isCalibrating = false;
+const MODEL_BASE = 'models/';      // relative path; works under any deployment prefix
+
+// Restore calibration from previous session
+try {
+  const stored = localStorage.getItem('calibrationEmbedding');
+  if (stored) calibrationEmbedding = JSON.parse(stored);
+} catch (e) { calibrationEmbedding = null; }
 
 // ── SETTINGS ──
 function getSetting(key, def) { return localStorage.getItem('hs-' + key) || def; }
@@ -897,6 +919,413 @@ function generateCoachingCues(bio, shape, view, duration) {
   return cues.slice(0, 4);
 }
 
+// ── PERSON TRACKING HELPERS ──
+
+// Cosine similarity between two L2-normalised vectors
+function cosineSimilarity(a, b) {
+  if (!a || !b || a.length !== b.length) return -1;
+  let s = 0;
+  for (let i = 0; i < a.length; i++) s += a[i] * b[i];
+  return s;
+}
+
+// IoU between two [x1,y1,x2,y2] boxes
+function iou(a, b) {
+  const x1 = Math.max(a[0], b[0]);
+  const y1 = Math.max(a[1], b[1]);
+  const x2 = Math.min(a[2], b[2]);
+  const y2 = Math.min(a[3], b[3]);
+  if (x2 <= x1 || y2 <= y1) return 0;
+  const inter = (x2 - x1) * (y2 - y1);
+  const aArea = (a[2] - a[0]) * (a[3] - a[1]);
+  const bArea = (b[2] - b[0]) * (b[3] - b[1]);
+  return inter / (aArea + bArea - inter + 1e-9);
+}
+
+// Single-target tracker — Kalman constant-velocity (cx, cy, w, h, vx, vy, vw, vh)
+class ByteTracker {
+  constructor() {
+    this.state = null;          // [cx, cy, w, h, vx, vy, vw, vh]
+    this.lastDetectionFrame = 0;
+    this.framesSinceUpdate = 0;
+    this.maxMissingFrames = 30;
+    this.embedding = null;
+    this.confirmed = false;
+  }
+
+  bboxToState(bbox) {
+    const [x1, y1, x2, y2] = bbox;
+    return [(x1 + x2) / 2, (y1 + y2) / 2, x2 - x1, y2 - y1, 0, 0, 0, 0];
+  }
+  stateToBbox(s) {
+    const [cx, cy, w, h] = s;
+    return [cx - w / 2, cy - h / 2, cx + w / 2, cy + h / 2];
+  }
+
+  predict() {
+    if (!this.state) return null;
+    // constant velocity step
+    this.state[0] += this.state[4];
+    this.state[1] += this.state[5];
+    this.state[2] += this.state[6];
+    this.state[3] += this.state[7];
+    // damp velocities slightly
+    for (let i = 4; i < 8; i++) this.state[i] *= 0.95;
+    this.framesSinceUpdate++;
+    if (this.framesSinceUpdate > this.maxMissingFrames) {
+      this.state = null;
+      this.confirmed = false;
+      return null;
+    }
+    return this.stateToBbox(this.state);
+  }
+
+  // detections: [{bbox, score, embedding?}]
+  // returns the tracked person's bbox or null
+  update(detections) {
+    if (!detections || detections.length === 0) return this.predict();
+
+    let best = null;
+    let bestScore = -Infinity;
+
+    if (calibrationEmbedding && detections.some(d => d.embedding)) {
+      // Pick by ReID similarity to calibration
+      for (const d of detections) {
+        if (!d.embedding) continue;
+        const sim = cosineSimilarity(calibrationEmbedding, d.embedding);
+        if (sim > bestScore) { bestScore = sim; best = d; }
+      }
+      // Require minimum similarity to avoid locking onto wrong person
+      if (bestScore < 0.35) best = null;
+    }
+
+    // Fallback: if we have a current state, prefer highest IoU match
+    if (!best && this.state) {
+      const predicted = this.stateToBbox(this.state);
+      for (const d of detections) {
+        const score = iou(predicted, d.bbox);
+        if (score > bestScore && score > 0.1) { bestScore = score; best = d; }
+      }
+    }
+
+    // Final fallback: highest confidence detection (initial lock)
+    if (!best) {
+      for (const d of detections) {
+        if (d.score > bestScore) { bestScore = d.score; best = d; }
+      }
+    }
+
+    if (best) {
+      const measured = this.bboxToState(best.bbox);
+      if (this.state) {
+        // Simple alpha blend (cheap stand-in for full Kalman update)
+        const alpha = 0.6;
+        for (let i = 0; i < 4; i++) {
+          // velocity = new measurement - previous position
+          this.state[i + 4] = (measured[i] - this.state[i]) * alpha + this.state[i + 4] * (1 - alpha);
+          this.state[i] = measured[i] * alpha + this.state[i] * (1 - alpha);
+        }
+      } else {
+        this.state = measured;
+      }
+      if (best.embedding) this.embedding = best.embedding;
+      this.framesSinceUpdate = 0;
+      this.confirmed = true;
+      return this.stateToBbox(this.state);
+    }
+
+    return this.predict();
+  }
+}
+
+// ── YOLOv8n inference ──
+// Returns array of detections in normalised image coords: [{bbox:[x1,y1,x2,y2], score}]
+// imageSource must be a drawable (HTMLVideoElement | HTMLCanvasElement).
+async function detectPersons(imageSource, srcW, srcH) {
+  if (!yoloSession) return [];
+  const INPUT = 640;
+
+  // Letterbox preprocess into 640x640
+  const scale = Math.min(INPUT / srcW, INPUT / srcH);
+  const newW = Math.round(srcW * scale);
+  const newH = Math.round(srcH * scale);
+  const padX = Math.floor((INPUT - newW) / 2);
+  const padY = Math.floor((INPUT - newH) / 2);
+
+  // Use offscreen canvas for resize
+  const tmp = detectPersons._canvas || (detectPersons._canvas = document.createElement('canvas'));
+  tmp.width = INPUT; tmp.height = INPUT;
+  const tctx = tmp.getContext('2d', { willReadFrequently: true });
+  tctx.fillStyle = 'rgb(114,114,114)';
+  tctx.fillRect(0, 0, INPUT, INPUT);
+  tctx.drawImage(imageSource, padX, padY, newW, newH);
+  const imgData = tctx.getImageData(0, 0, INPUT, INPUT).data;
+
+  // CHW float32, [0,1]
+  const data = new Float32Array(3 * INPUT * INPUT);
+  const planeSize = INPUT * INPUT;
+  for (let i = 0; i < planeSize; i++) {
+    data[i] = imgData[i * 4] / 255;                  // R
+    data[i + planeSize] = imgData[i * 4 + 1] / 255;  // G
+    data[i + 2 * planeSize] = imgData[i * 4 + 2] / 255; // B
+  }
+  const tensor = new ort.Tensor('float32', data, [1, 3, INPUT, INPUT]);
+
+  let output;
+  try {
+    const feeds = {};
+    feeds[yoloSession.inputNames[0]] = tensor;
+    const out = await yoloSession.run(feeds);
+    output = out[yoloSession.outputNames[0]];
+    yoloInferenceCount++;
+  } catch (e) {
+    console.warn('YOLO inference failed:', e);
+    return [];
+  }
+
+  // YOLOv8 output shape: [1, 84, 8400] (or [1, 8400, 84] depending on export)
+  // 84 = 4 box + 80 class scores. We only care about class 0 (person).
+  const dims = output.dims;
+  const arr = output.data;
+  let numBoxes, numChannels, transposed;
+  if (dims[1] === 84) { numChannels = 84; numBoxes = dims[2]; transposed = true; }
+  else { numChannels = dims[2]; numBoxes = dims[1]; transposed = false; }
+
+  const detections = [];
+  const CONF_THRESH = 0.4;
+  for (let i = 0; i < numBoxes; i++) {
+    let cx, cy, w, h, personScore;
+    if (transposed) {
+      cx = arr[0 * numBoxes + i];
+      cy = arr[1 * numBoxes + i];
+      w  = arr[2 * numBoxes + i];
+      h  = arr[3 * numBoxes + i];
+      personScore = arr[4 * numBoxes + i]; // class 0 = person
+    } else {
+      cx = arr[i * numChannels + 0];
+      cy = arr[i * numChannels + 1];
+      w  = arr[i * numChannels + 2];
+      h  = arr[i * numChannels + 3];
+      personScore = arr[i * numChannels + 4];
+    }
+    if (personScore < CONF_THRESH) continue;
+
+    // Undo letterbox → original image coords (still in [0,1] of original)
+    const x1 = Math.max(0, (cx - w/2 - padX) / scale / srcW);
+    const y1 = Math.max(0, (cy - h/2 - padY) / scale / srcH);
+    const x2 = Math.min(1, (cx + w/2 - padX) / scale / srcW);
+    const y2 = Math.min(1, (cy + h/2 - padY) / scale / srcH);
+    if (x2 <= x1 || y2 <= y1) continue;
+    detections.push({ bbox: [x1, y1, x2, y2], score: personScore });
+  }
+
+  // Simple NMS
+  detections.sort((a, b) => b.score - a.score);
+  const kept = [];
+  for (const d of detections) {
+    let drop = false;
+    for (const k of kept) {
+      if (iou(d.bbox, k.bbox) > 0.5) { drop = true; break; }
+    }
+    if (!drop) kept.push(d);
+    if (kept.length >= 5) break; // cap detections
+  }
+  return kept;
+}
+
+// ── OSNet x0_25 ReID ──
+// Returns 256-dim L2-normalised embedding (Float32Array) or null on failure.
+async function getPersonEmbedding(imageSource, bbox, srcW, srcH) {
+  if (!reidSession) return null;
+  const REID_W = 128, REID_H = 256;
+
+  const [nx1, ny1, nx2, ny2] = bbox;
+  const x = Math.max(0, Math.floor(nx1 * srcW));
+  const y = Math.max(0, Math.floor(ny1 * srcH));
+  const w = Math.max(2, Math.floor((nx2 - nx1) * srcW));
+  const h = Math.max(2, Math.floor((ny2 - ny1) * srcH));
+  if (x + w > srcW || y + h > srcH) return null;
+
+  const tmp = getPersonEmbedding._canvas || (getPersonEmbedding._canvas = document.createElement('canvas'));
+  tmp.width = REID_W; tmp.height = REID_H;
+  const tctx = tmp.getContext('2d', { willReadFrequently: true });
+  tctx.drawImage(imageSource, x, y, w, h, 0, 0, REID_W, REID_H);
+  const imgData = tctx.getImageData(0, 0, REID_W, REID_H).data;
+
+  // ImageNet normalisation
+  const MEAN = [0.485, 0.456, 0.406];
+  const STD  = [0.229, 0.224, 0.225];
+  const data = new Float32Array(3 * REID_H * REID_W);
+  const planeSize = REID_H * REID_W;
+  for (let i = 0; i < planeSize; i++) {
+    data[i]              = (imgData[i*4]   / 255 - MEAN[0]) / STD[0];
+    data[i + planeSize]  = (imgData[i*4+1] / 255 - MEAN[1]) / STD[1];
+    data[i + 2*planeSize] = (imgData[i*4+2] / 255 - MEAN[2]) / STD[2];
+  }
+  const tensor = new ort.Tensor('float32', data, [1, 3, REID_H, REID_W]);
+
+  let output;
+  try {
+    const feeds = {};
+    feeds[reidSession.inputNames[0]] = tensor;
+    const out = await reidSession.run(feeds);
+    output = out[reidSession.outputNames[0]];
+    reidInferenceCount++;
+  } catch (e) {
+    console.warn('OSNet inference failed:', e);
+    return null;
+  }
+
+  const emb = Array.from(output.data);
+  // L2 normalise
+  let norm = 0;
+  for (const v of emb) norm += v * v;
+  norm = Math.sqrt(norm) || 1;
+  for (let i = 0; i < emb.length; i++) emb[i] /= norm;
+  return emb;
+}
+
+// ── ONNX session lifecycle ──
+async function initOnnxSessions() {
+  if (typeof ort === 'undefined') {
+    console.warn('ONNX Runtime Web not loaded');
+    return;
+  }
+  const ep = ['webgpu', 'wasm'];
+  try {
+    yoloSession = await ort.InferenceSession.create(MODEL_BASE + 'yolov8n.onnx', { executionProviders: ep });
+    reidSession = await ort.InferenceSession.create(MODEL_BASE + 'osnet_x0_25.onnx', { executionProviders: ep });
+    byteTracker = new ByteTracker();
+    yoloInferenceCount = 0;
+    reidInferenceCount = 0;
+    console.log('ONNX sessions initialised', { yolo: !!yoloSession, reid: !!reidSession });
+  } catch (e) {
+    console.warn('ONNX init failed, tracking disabled:', e);
+    yoloSession = null; reidSession = null; byteTracker = null;
+  }
+}
+
+// iOS Safari WebGPU stability — recreate sessions periodically
+async function maybeRecreateOnnxSessions() {
+  if (yoloInferenceCount < ONNX_SESSION_RECREATE_AT && reidInferenceCount < ONNX_SESSION_RECREATE_AT) return;
+  console.log('Recreating ONNX sessions for stability');
+  const oldYolo = yoloSession, oldReid = reidSession;
+  yoloSession = null; reidSession = null;
+  try { await oldYolo?.release?.(); } catch {}
+  try { await oldReid?.release?.(); } catch {}
+  await initOnnxSessions();
+}
+
+// Per-frame tracking step — runs YOLO occasionally, Kalman every frame
+async function trackFrame(videoSource, srcW, srcH) {
+  if (!byteTracker || !yoloSession) return;
+  // Calibration owns ONNX exclusively while it runs (avoids concurrent run() collisions).
+  if (isCalibrating) {
+    trackedBbox = byteTracker.predict();
+    return;
+  }
+  if (onnxBusy) {
+    // Just run a Kalman predict to keep momentum
+    trackedBbox = byteTracker.predict();
+    return;
+  }
+  yoloFrameCounter++;
+  const shouldDetect = (yoloFrameCounter % YOLO_DETECT_INTERVAL === 0);
+
+  if (!shouldDetect) {
+    trackedBbox = byteTracker.predict();
+    return;
+  }
+
+  onnxBusy = true;
+  try {
+    const detections = await detectPersons(videoSource, srcW, srcH);
+
+    // Compute embeddings only for top-2 detections to keep cost down,
+    // and only when we have a calibration to match against.
+    if (calibrationEmbedding && detections.length > 0) {
+      const top = detections.slice(0, 2);
+      for (const d of top) {
+        d.embedding = await getPersonEmbedding(videoSource, d.bbox, srcW, srcH);
+      }
+    }
+
+    trackedBbox = byteTracker.update(detections);
+    await maybeRecreateOnnxSessions();
+  } catch (e) {
+    console.warn('trackFrame error:', e);
+  } finally {
+    onnxBusy = false;
+  }
+}
+
+// ── CALIBRATION ──
+async function calibrateUser() {
+  if (!cameraStarted) { showToast('start camera first'); return; }
+  if (!yoloSession || !reidSession) { showToast('models not loaded'); return; }
+  if (isCalibrating) return;
+  isCalibrating = true;
+
+  const status = document.getElementById('pose-status');
+  const oldStatus = status.textContent;
+  const calBtn = document.getElementById('cal-btn');
+  if (calBtn) { calBtn.disabled = true; calBtn.textContent = 'CAL…'; }
+  status.textContent = 'CALIBRATING — stand in frame for 3 seconds';
+  showToast('calibrating — stand in frame');
+
+  const FRAMES = 5;
+  const INTERVAL = 600; // ms; ~3s total
+  const embeddings = [];
+
+  for (let i = 0; i < FRAMES; i++) {
+    await new Promise(r => setTimeout(r, INTERVAL));
+    if (!videoEl) break;
+    const w = videoEl.videoWidth, h = videoEl.videoHeight;
+    if (!w || !h) continue;
+    try {
+      const dets = await detectPersons(videoEl, w, h);
+      if (dets.length === 0) continue;
+      // Pick largest bbox (most likely the calibrating user)
+      dets.sort((a, b) => {
+        const aArea = (a.bbox[2]-a.bbox[0]) * (a.bbox[3]-a.bbox[1]);
+        const bArea = (b.bbox[2]-b.bbox[0]) * (b.bbox[3]-b.bbox[1]);
+        return bArea - aArea;
+      });
+      const emb = await getPersonEmbedding(videoEl, dets[0].bbox, w, h);
+      if (emb) embeddings.push(emb);
+    } catch (e) { console.warn('calibration frame failed', e); }
+  }
+
+  if (embeddings.length === 0) {
+    status.textContent = oldStatus;
+    if (calBtn) { calBtn.disabled = false; calBtn.textContent = 'CAL'; }
+    showToast('calibration failed — no person detected');
+    isCalibrating = false;
+    return;
+  }
+
+  // Average + L2 normalise
+  const dim = embeddings[0].length;
+  const avg = new Array(dim).fill(0);
+  for (const e of embeddings) for (let i = 0; i < dim; i++) avg[i] += e[i];
+  for (let i = 0; i < dim; i++) avg[i] /= embeddings.length;
+  let norm = 0;
+  for (const v of avg) norm += v * v;
+  norm = Math.sqrt(norm) || 1;
+  for (let i = 0; i < dim; i++) avg[i] /= norm;
+  calibrationEmbedding = avg;
+  try { localStorage.setItem('calibrationEmbedding', JSON.stringify(avg)); } catch {}
+
+  // Reset tracker so the calibrated person locks in fresh
+  if (byteTracker) byteTracker = new ByteTracker();
+
+  status.textContent = 'CALIBRATED';
+  showToast(`calibrated · ${embeddings.length} samples`);
+  setTimeout(() => { status.textContent = oldStatus; }, 2000);
+  if (calBtn) { calBtn.disabled = false; calBtn.textContent = 'CAL ✓'; }
+  isCalibrating = false;
+}
+
 // ── CAMERA + POSE ──
 async function startCamera() {
   if (cameraStarted) return;
@@ -945,6 +1374,16 @@ async function startCamera() {
     document.getElementById('zoom-row').classList.add('visible');
     document.getElementById('pose-status').textContent = 'loading pose model...';
 
+    // Initialise ONNX person-tracking sessions (graceful failure if models missing)
+    initOnnxSessions().catch(e => console.warn('ONNX init error:', e));
+
+    // Show CAL button now that camera is live
+    const calBtn = document.getElementById('cal-btn');
+    if (calBtn) {
+      calBtn.style.display = 'inline-block';
+      if (calibrationEmbedding) calBtn.textContent = 'CAL ✓';
+    }
+
     const pose = new Pose({ locateFile: f => `https://cdn.jsdelivr.net/npm/@mediapipe/pose/${f}` });
     pose.setOptions({ modelComplexity: 1, smoothLandmarks: true, minDetectionConfidence: 0.6, minTrackingConfidence: 0.6 });
 
@@ -974,6 +1413,26 @@ async function startCamera() {
 
       if (results.poseLandmarks) {
         const lm = results.poseLandmarks;
+
+        // Person-tracking gate: when calibration + tracker are active, ensure
+        // MediaPipe's detected person matches our tracked target. Use wrist
+        // midpoint (lm[15]/lm[16]) as a reliable handstand-friendly proxy
+        // (head can be near edge of frame, but hands are usually visible).
+        // Landmarks are in unflipped image space; bbox is too — no mirror flip.
+        if (trackedBbox && calibrationEmbedding) {
+          const wristMid = {
+            x: (lm[15].x + lm[16].x) / 2,
+            y: (lm[15].y + lm[16].y) / 2
+          };
+          const [bx1, by1, bx2, by2] = trackedBbox;
+          // Allow a small margin for inverted poses (hands near image edge)
+          const margin = 0.05;
+          if (wristMid.x < bx1 - margin || wristMid.x > bx2 + margin ||
+              wristMid.y < by1 - margin || wristMid.y > by2 + margin) {
+            return; // wrong person — skip this frame entirely
+          }
+        }
+
         currentView = detectView(lm);
         currentShape = detectShape(lm);
 
@@ -1012,6 +1471,13 @@ async function startCamera() {
         if (canvas.width !== videoEl.videoWidth || canvas.height !== videoEl.videoHeight) {
           canvas.width = videoEl.videoWidth;
           canvas.height = videoEl.videoHeight;
+        }
+        // Person-tracking step (YOLO every N frames, Kalman every frame)
+        // Updates `trackedBbox` so it's fresh by the time onResults runs.
+        if (yoloSession && byteTracker) {
+          // Don't await — let it race with pose.send for throughput.
+          // The tracker state is consistent because trackFrame guards with onnxBusy.
+          trackFrame(videoEl, videoEl.videoWidth, videoEl.videoHeight);
         }
         await pose.send({ image: videoEl });
       }

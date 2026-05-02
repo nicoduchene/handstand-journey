@@ -1,4 +1,4 @@
-const CACHE_NAME = 'handstand-v2';
+const CACHE_NAME = 'handstand-v3';
 
 const LOCAL_ASSETS = [
   'index.html',
@@ -6,7 +6,14 @@ const LOCAL_ASSETS = [
   'manifest.json'
 ];
 
-// MediaPipe CDN assets — JS + WASM + model files
+// Model files served locally — populated on first request via fetch handler
+// (they may not exist at install time; the fetch handler caches them lazily)
+const MODEL_PATHS = [
+  'models/yolov8n.onnx',
+  'models/osnet_x0_25.onnx',
+];
+
+// MediaPipe + ONNX Runtime Web CDN assets — JS + WASM + model files
 const CDN_ASSETS = [
   'https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose.js',
   'https://cdn.jsdelivr.net/npm/@mediapipe/camera_utils/camera_utils.js',
@@ -15,24 +22,28 @@ const CDN_ASSETS = [
   'https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose_solution_packed_assets.data',
   'https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose_solution_simd_wasm_bin.wasm',
   'https://cdn.jsdelivr.net/npm/@mediapipe/pose/pose_web.binarypb',
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort.min.js',
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort-wasm-simd-threaded.wasm',
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort-wasm-simd.wasm',
+  'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.18.0/dist/ort-wasm.wasm',
 ];
 
 self.addEventListener('install', e => {
   e.waitUntil(
     caches.open(CACHE_NAME).then(cache =>
-      // Cache local assets first (fast), then CDN assets (can be slow)
-      cache.addAll(LOCAL_ASSETS).then(() =>
-        // CDN assets cached individually so one failure doesn't block install
-        Promise.allSettled(
-          CDN_ASSETS.map(url =>
-            fetch(url, { mode: 'cors' })
+      // Cache local assets first (fast), then CDN + model assets (can be slow)
+      cache.addAll(LOCAL_ASSETS).then(() => {
+        const allUrls = [...CDN_ASSETS, ...MODEL_PATHS];
+        return Promise.allSettled(
+          allUrls.map(url =>
+            fetch(url, { mode: url.startsWith('http') ? 'cors' : 'same-origin' })
               .then(res => {
                 if (res.ok) return cache.put(url, res);
               })
               .catch(() => {})
           )
-        )
-      )
+        );
+      })
     )
   );
   self.skipWaiting();
